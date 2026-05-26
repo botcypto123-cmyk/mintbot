@@ -1,4754 +1,1611 @@
 require("dotenv").config();
-
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const http = require("http");
 const EventEmitter = require("events");
 const { ethers } = require("ethers");
 
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const LEGACY_RPC_URL = process.env.RPC_URL;
-const LEGACY_CHAIN_ID = Number(process.env.CHAIN_ID || 1);
+const LEGACY_RPC_URL     = process.env.RPC_URL;
+const LEGACY_CHAIN_ID    = Number(process.env.CHAIN_ID || 1);
+const DEFAULT_TIMEZONE   = process.env.DEFAULT_TIMEZONE || "UTC";
+const AUTO_MINT_DELAY_MS = Number(process.env.AUTO_MINT_DELAY_MS   || 5000);
+const POLL_MS            = Number(process.env.POLL_INTERVAL_MS     || 30000);
+const RETRY_WINDOW_MS    = Number(process.env.AUTO_MINT_RETRY_WINDOW_MS || 300000);
+const MAX_ATTEMPTS       = Number(process.env.AUTO_MINT_MAX_ATTEMPTS    || 10);
+const TOP_OFFER_POLL_MS  = Number(process.env.TOP_OFFER_POLL_MS    || 120000);
+const SALE_POLL_MS       = Number(process.env.SALE_POLL_MS         || 600000);
+const STATE_TIMEOUT_MS   = Number(process.env.STATE_TIMEOUT_MS     || 600000);
+const BASE_GAS_BOOST     = 110n;
+const GAS_WAR_STEP       = BigInt(process.env.GAS_WAR_STEP_PERCENT || 15);
+const DEFAULT_GAS_LIMIT  = BigInt(process.env.DEFAULT_GAS_LIMIT    || 300000);
+const WALLET_KEY         = process.env.WALLET_ENCRYPTION_KEY || "";
+const ADMIN_ID           = Number(process.env.ADMIN_USER_ID   || 0);
+const TREASURY           = process.env.TREASURY_WALLET        || "";
+const FEE_BPS            = 500;
+
 const DEFAULT_DATA_FILE = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "mintbot.json")
   : "./data/mintbot.json";
 const DATA_FILE = path.resolve(__dirname, process.env.DATA_FILE || DEFAULT_DATA_FILE);
-const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || "UTC";
-const AUTO_MINT_DELAY_MS = Number(process.env.AUTO_MINT_DELAY_MS || 5000);
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
-const AUTO_MINT_RETRY_WINDOW_MS = Number(process.env.AUTO_MINT_RETRY_WINDOW_MS || 300000);
-const AUTO_MINT_MAX_ATTEMPTS = Number(process.env.AUTO_MINT_MAX_ATTEMPTS || 10);
-const GAS_BOOST_PERCENT = BigInt(process.env.GAS_BOOST_PERCENT || process.env.BASELINE_GAS_BOOST_PERCENT || 110);
-const GAS_WAR_STEP_PERCENT = BigInt(process.env.GAS_WAR_STEP_PERCENT || 10);
-const DEFAULT_GAS_LIMIT = BigInt(process.env.DEFAULT_GAS_LIMIT || 300000);
-const DEFAULT_GAS_CAP_MULTIPLIER_PERCENT = BigInt(process.env.DEFAULT_GAS_CAP_MULTIPLIER_PERCENT || 150);
-const WALLET_ENCRYPTION_KEY = process.env.WALLET_ENCRYPTION_KEY || "";
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? String(process.env.ADMIN_USER_ID) : "";
-const PLATFORM_PROFIT_FEE_BPS = BigInt(process.env.PLATFORM_PROFIT_FEE_BPS || 500);
-const TREASURY_WALLET = process.env.TREASURY_WALLET || "";
-const WEBHOOK_PORT = Number(process.env.PORT || process.env.WEBHOOK_PORT || 3000);
-const ALCHEMY_WEBHOOK_AUTH_TOKEN = process.env.ALCHEMY_WEBHOOK_AUTH_TOKEN || "";
-const MINT_REGISTRY_BY_CHAIN = {
-  1: process.env.MINT_REGISTRY_ETH || "",
-  8453: process.env.MINT_REGISTRY_BASE || ""
-};
-const FEE_ROUTER_BY_CHAIN = {
-  1: process.env.FEE_ROUTER_CONTRACT_ETH || "",
-  8453: process.env.FEE_ROUTER_CONTRACT_BASE || ""
-};
 
-const CHAIN_CONFIGS = {
-  ethereum: {
-    key: "ethereum",
-    chainId: 1,
-    chainName: "Ethereum",
-    openSeaChain: "ethereum",
-    rpcUrls: rpcUrlsFor("ETHEREUM", LEGACY_CHAIN_ID === 1 ? LEGACY_RPC_URL : null)
-  },
-  base: {
-    key: "base",
-    chainId: 8453,
-    chainName: "Base",
-    openSeaChain: "base",
-    rpcUrls: rpcUrlsFor("BASE", LEGACY_CHAIN_ID === 8453 ? LEGACY_RPC_URL : null)
-  }
+const RPC_ETH  = [process.env.RPC_URL_1||process.env.ETHEREUM_RPC_URL||(LEGACY_CHAIN_ID===1?LEGACY_RPC_URL:null), process.env.RPC_URL_2, process.env.RPC_URL_3].filter(Boolean);
+const RPC_BASE = [process.env.BASE_RPC_URL||(LEGACY_CHAIN_ID===8453?LEGACY_RPC_URL:null)].filter(Boolean);
+
+const CHAIN = {
+  ethereum: { key:"ethereum", chainId:1,    chainName:"Ethereum", openSeaChain:"ethereum", rpcUrls:RPC_ETH,  flashbotsRpc:"https://rpc.flashbots.net" },
+  base:     { key:"base",     chainId:8453, chainName:"Base",     openSeaChain:"base",     rpcUrls:RPC_BASE, flashbotsRpc:"https://rpc.flashbots.net/fast" }
 };
-
-for (const chain of Object.values(CHAIN_CONFIGS)) {
-  chain.rpcUrl = chain.rpcUrls[0] || null;
-}
-
-const OPENSEA_CHAIN_TO_CHAIN_ID = Object.fromEntries(
-  Object.values(CHAIN_CONFIGS).map((chain) => [chain.openSeaChain, chain.chainId])
-);
+const OS_CHAIN_TO_ID = Object.fromEntries(Object.values(CHAIN).map(c=>[c.openSeaChain,c.chainId]));
 
 const REMINDERS = [
-  { key: "r_86400", seconds: 86400, label: "24h" },
-  { key: "r_43200", seconds: 43200, label: "12h" },
-  { key: "r_21600", seconds: 21600, label: "6h" },
-  { key: "r_10800", seconds: 10800, label: "3h" },
-  { key: "r_3600", seconds: 3600, label: "1h" },
-  { key: "r_1800", seconds: 1800, label: "30m" },
-  { key: "r_900", seconds: 900, label: "15m" },
-  { key: "r_300", seconds: 300, label: "5m" }
+  {key:"r_86400",seconds:86400,label:"24h"},{key:"r_43200",seconds:43200,label:"12h"},
+  {key:"r_21600",seconds:21600,label:"6h"}, {key:"r_10800",seconds:10800,label:"3h"},
+  {key:"r_3600", seconds:3600, label:"1h"}, {key:"r_1800", seconds:1800, label:"30m"},
+  {key:"r_900",  seconds:900,  label:"15m"},{key:"r_300",  seconds:300,  label:"5m"}
 ];
 
-const RISK_MODES = {
-  safe: {
-    key: "safe",
-    label: "Safe",
-    gasWarMode: false,
-    flashbotsEnabled: true,
-    gasCapMultiplierPercent: 125n,
-    gasBoostPercent: 105n
-  },
-  fast: {
-    key: "fast",
-    label: "Fast",
-    gasWarMode: false,
-    flashbotsEnabled: false,
-    gasCapMultiplierPercent: 150n,
-    gasBoostPercent: 110n
-  },
-  degenerate: {
-    key: "degenerate",
-    label: "Degenerate",
-    gasWarMode: true,
-    flashbotsEnabled: true,
-    gasCapMultiplierPercent: 200n,
-    gasBoostPercent: 125n
-  }
-};
+// 5 keyboard buttons. Clean.
+const KEYBOARD = { reply_markup:{ keyboard:[["Track","Wallet"],["Status","Gas","History"]], resize_keyboard:true, one_time_keyboard:false }};
 
-const MAIN_MENU_KEYBOARD = {
-  reply_markup: {
-    keyboard: [
-      ["Wallet", "Track Mint"],
-      ["Instant Mint", "Receive"],
-      ["Fund Wallet", "Ready Check"],
-      ["Send NFT", "Send Token"],
-      ["Auto-Buy", "Reminders"],
-      ["Gas", "Portfolio"],
-      ["Buy History", "Trending"],
-      ["PnL", "Menu"],
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  }
-};
+const MINT_FN_PRIORITY = ["mint","publicMint","publicSaleMint","whitelistMint","allowlistMint","presaleMint","ogMint","gtdMint","claim","purchase"];
 
-const COMMON_MINT_ABI = [
-  "function mint() payable",
-  "function mint(uint256 quantity) payable",
-  "function mint(address to, uint256 quantity) payable",
-  "function publicMint() payable",
-  "function publicMint(uint256 quantity) payable",
-  "function publicMint(address to, uint256 quantity) payable",
-  "function whitelistMint(uint256 quantity) payable",
-  "function allowlistMint(uint256 quantity) payable",
-  "function presaleMint(uint256 quantity) payable",
-  "function claim(uint256 quantity) payable",
-  "function purchase(uint256 quantity) payable"
+const COMMON_ABI = [
+  "function mint() payable","function mint(uint256 quantity) payable","function mint(address to, uint256 quantity) payable",
+  "function publicMint() payable","function publicMint(uint256 quantity) payable","function publicMint(address to, uint256 quantity) payable",
+  "function whitelistMint(uint256 quantity) payable","function allowlistMint(uint256 quantity) payable",
+  "function presaleMint(uint256 quantity) payable","function claim(uint256 quantity) payable","function purchase(uint256 quantity) payable",
+  "function totalSupply() view returns (uint256)","function balanceOf(address owner) view returns (uint256)",
+  "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)"
 ];
-
-const MINT_FUNCTION_PRIORITY = [
-  "mint",
-  "publicMint",
-  "publicSaleMint",
-  "whitelistMint",
-  "allowlistMint",
-  "presaleMint",
-  "ogMint",
-  "gtdMint",
-  "claim",
-  "purchase"
-];
-
-const PHASE_TIME_READS = {
-  gtd: [
-    "gtdStartTime",
-    "gtdMintStartTime",
-    "guaranteedStartTime",
-    "guaranteedMintStartTime",
-    "guaranteedSaleStartTime",
-    "earlyAccessStartTime",
-    "startGTD"
-  ],
-  og: [
-    "ogStartTime",
-    "ogMintStartTime",
-    "ogSaleStartTime",
-    "earlyAccessStartTime",
-    "presaleStartTime",
-    "privateSaleStartTime",
-    "startOG"
-  ],
-  wl: [
-    "wlStartTime",
-    "wlMintStartTime",
-    "whitelistStartTime",
-    "whitelistMintStartTime",
-    "allowlistStartTime",
-    "allowlistMintStartTime",
-    "presaleStartTime",
-    "preSaleStartTime",
-    "privateSaleStartTime",
-    "startWhitelist"
-  ],
-  public: [
-    "publicStartTime",
-    "publicMintStartTime",
-    "publicSaleStartTime",
-    "saleStartTime",
-    "mintStartTime",
-    "startTime",
-    "saleStart",
-    "mintStart",
-    "publicSaleStart",
-    "startPublic"
-  ]
-};
-
-const PRICE_READS = [
-  "mintPrice",
-  "price",
-  "cost",
-  "publicPrice",
-  "publicSalePrice",
-  "salePrice",
-  "tokenPrice",
-  "MINT_PRICE",
-  "PUBLIC_PRICE",
-  "PRICE"
-];
-
-const PHASE_PRICE_READS = {
-  gtd: ["gtdPrice", "guaranteedPrice", "guaranteedMintPrice"],
-  og: ["ogPrice", "ogMintPrice", "presalePrice"],
-  wl: ["wlPrice", "whitelistPrice", "allowlistPrice", "presalePrice"],
-  public: ["publicPrice", "publicSalePrice", "mintPrice", "price", "cost"]
-};
-
-const READ_ONLY_ABI = [
-  ...new Set([
-    ...Object.values(PHASE_TIME_READS).flat(),
-    ...PRICE_READS,
-    ...Object.values(PHASE_PRICE_READS).flat()
-  ])
-].map((name) => `function ${name}() view returns (uint256)`);
-
 const ERC20_ABI = [
-  "function transfer(address to, uint256 amount) returns (bool)",
-  "function decimals() view returns (uint8)",
-  "function symbol() view returns (string)"
+  "function transfer(address to, uint256 amount) returns (bool)","function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)","function symbol() view returns (string)"
 ];
-
 const ERC721_ABI = [
   "function transferFrom(address from, address to, uint256 tokenId)",
   "function safeTransferFrom(address from, address to, uint256 tokenId)",
-  "function ownerOf(uint256 tokenId) view returns (address)",
-  "function isApprovedForAll(address owner, address operator) view returns (bool)"
+  "function tokenOfOwnerByIndex(address owner, uint256 index) view returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
 ];
 
-const FEE_ROUTER_ABI = [
-  "function routeMint(address nftContract, bytes mintCallData, uint256 mintValueWei, uint256 platformFeeWei, uint256 expectedTokenId, address userWallet) payable returns (bytes)"
-];
+const PHASE_TIMES = {
+  gtd:    ["gtdStartTime","gtdMintStartTime","guaranteedStartTime","guaranteedMintStartTime","earlyAccessStartTime","startGTD"],
+  og:     ["ogStartTime","ogMintStartTime","presaleStartTime","privateSaleStartTime","startOG"],
+  wl:     ["wlStartTime","wlMintStartTime","whitelistStartTime","allowlistStartTime","presaleStartTime","preSaleStartTime","startWhitelist"],
+  public: ["publicStartTime","publicMintStartTime","saleStartTime","mintStartTime","startTime","saleStart","mintStart","publicSaleStart","startPublic"]
+};
+const PRICE_READS = ["mintPrice","price","cost","publicPrice","publicSalePrice","salePrice","tokenPrice","MINT_PRICE","PUBLIC_PRICE","PRICE"];
+const PHASE_PRICES = {
+  gtd:["gtdPrice","guaranteedPrice","guaranteedMintPrice"],
+  og:["ogPrice","ogMintPrice","presalePrice"],
+  wl:["wlPrice","whitelistPrice","allowlistPrice","presalePrice"],
+  public:["publicPrice","publicSalePrice","mintPrice","price","cost"]
+};
+const READ_ONLY_ABI = [...new Set([...Object.values(PHASE_TIMES).flat(),...PRICE_READS,...Object.values(PHASE_PRICES).flat()])].map(n=>`function ${n}() view returns (uint256)`);
 
-if (!TELEGRAM_BOT_TOKEN) {
-  console.error("Missing TELEGRAM_BOT_TOKEN in .env");
-  process.exit(1);
-}
+const REVERT_SOLD_OUT   = ["sold out","max supply","exceeds max","supply exceeded","no more tokens","soldout","maxsupply"];
+const REVERT_PER_WALLET = ["max per wallet","already claimed","exceeds allowance","mint limit","already minted","wallet limit","per wallet"];
+const REVERT_WRONG_PHASE = ["not active","sale not live","presale not active","not whitelisted","not on allowlist","invalid proof","not eligible","not started","paused"];
 
+if (!TELEGRAM_BOT_TOKEN) { console.error("TELEGRAM_BOT_TOKEN missing"); process.exit(1); }
+
+// ─── TELEGRAM CLIENT ─────────────────────────────────────────────────────────
 class TelegramBot extends EventEmitter {
-  constructor(token, options = {}) {
-    super();
-    this.token = token;
-    this.offset = 0;
-    this.textHandlers = [];
-    this.polling = Boolean(options.polling);
-    this.pollingStopped = false;
-
-    if (this.polling) {
-      this.pollLoop();
-    }
+  constructor(token, options={}) {
+    super(); this.token=token; this.offset=0; this.textHandlers=[];
+    if (options.polling) this.pollLoop();
   }
-
-  onText(regex, callback) {
-    this.textHandlers.push({ regex, callback });
-  }
-
-  async api(method, payload = {}) {
-    const response = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data || !data.ok) {
-      const description = data && data.description ? data.description : response.statusText;
-      throw new Error(`Telegram ${method} failed: ${description}`);
-    }
-
+  onText(regex,fn){ this.textHandlers.push({regex,fn}); }
+  async api(method, payload={}) {
+    const res  = await fetch(`https://api.telegram.org/bot${this.token}/${method}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const data = await res.json().catch(()=>null);
+    if (!res.ok||!data?.ok) throw new Error(`Telegram ${method}: ${data?.description||res.statusText}`);
     return data.result;
   }
-
-  async setMyCommands(commands) {
-    return this.api("setMyCommands", { commands });
-  }
-
-  async sendMessage(chatId, text, options = {}) {
-    return this.api("sendMessage", { chat_id: chatId, text, ...options });
-  }
-
-  async sendPhoto(chatId, photo, options = {}) {
-    return this.api("sendPhoto", { chat_id: chatId, photo, ...options });
-  }
-
-  async editMessageText(text, options = {}) {
-    return this.api("editMessageText", { text, ...options });
-  }
-
-  async deleteMessage(chatId, messageId) {
-    return this.api("deleteMessage", { chat_id: chatId, message_id: messageId });
-  }
-
-  async answerCallbackQuery(callbackQueryId, options = {}) {
-    return this.api("answerCallbackQuery", { callback_query_id: callbackQueryId, ...options });
-  }
-
+  async setMyCommands(c) { return this.api("setMyCommands",{commands:c}); }
+  async sendMessage(chatId,text,opts={}) { return this.api("sendMessage",{chat_id:chatId,text,...opts}); }
+  async editMessageText(text,opts={}) { return this.api("editMessageText",{text,...opts}); }
+  async deleteMessage(chatId,messageId) { return this.api("deleteMessage",{chat_id:chatId,message_id:messageId}); }
+  async answerCallbackQuery(id,opts={}) { return this.api("answerCallbackQuery",{callback_query_id:id,...opts}); }
   async pollLoop() {
-    while (!this.pollingStopped) {
+    while (true) {
       try {
-        const updates = await this.api("getUpdates", {
-          offset: this.offset,
-          timeout: 25,
-          allowed_updates: ["message", "callback_query"]
-        });
-
-        for (const update of updates) {
-          this.offset = update.update_id + 1;
-          this.handleUpdate(update);
-        }
-      } catch (err) {
-        this.emit("polling_error", err);
-        await sleep(3000);
-      }
+        const updates = await this.api("getUpdates",{offset:this.offset,timeout:25,allowed_updates:["message","callback_query"]});
+        for (const u of updates) { this.offset=u.update_id+1; this.handleUpdate(u); }
+      } catch(err) { this.emit("polling_error",err); await sleep(3000); }
     }
   }
-
-  handleUpdate(update) {
-    if (update.message) {
-      const message = update.message;
-      if (message.text) {
-        for (const handler of this.textHandlers) {
-          handler.regex.lastIndex = 0;
-          const match = message.text.match(handler.regex);
-          if (match) {
-            Promise.resolve(handler.callback(message, match)).catch((err) => {
-              this.emit("polling_error", err);
-            });
-          }
-        }
-      }
-
-      this.dispatch("message", message);
+  handleUpdate(u) {
+    if (u.message) {
+      const msg=u.message;
+      if (msg.text) for (const h of this.textHandlers) { h.regex.lastIndex=0; const m=msg.text.match(h.regex); if(m) Promise.resolve(h.fn(msg,m)).catch(e=>this.emit("polling_error",e)); }
+      this.dispatch("message",msg);
     }
-
-    if (update.callback_query) {
-      this.dispatch("callback_query", update.callback_query);
-    }
+    if (u.callback_query) this.dispatch("callback_query",u.callback_query);
   }
-
-  dispatch(eventName, ...args) {
-    for (const listener of this.listeners(eventName)) {
-      try {
-        Promise.resolve(listener(...args)).catch((err) => {
-          this.emit("polling_error", err);
-        });
-      } catch (err) {
-        this.emit("polling_error", err);
-      }
-    }
+  dispatch(event,...args) {
+    for (const l of this.listeners(event)) { try { Promise.resolve(l(...args)).catch(e=>this.emit("polling_error",e)); } catch(e){this.emit("polling_error",e);} }
   }
 }
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-const providersByChainId = new Map(
-  Object.values(CHAIN_CONFIGS)
-    .filter((chain) => chain.rpcUrls.length)
-    .map((chain) => [chain.chainId, makeProvider(chain)])
-);
-const activeAutoMintTimers = new Map();
+// ─── RPC FALLBACK ─────────────────────────────────────────────────────────────
+class FallbackProvider {
+  constructor(urls,chainId,chainName) {
+    this.urls=urls; this.chainId=chainId; this.chainName=chainName; this.idx=0;
+    this.providers=urls.map(u=>new ethers.JsonRpcProvider(u,chainId));
+  }
+  getActive(){ return this.providers[this.idx]; }
+  async call(method,...args) {
+    for (let i=0;i<this.providers.length;i++) {
+      const idx=(this.idx+i)%this.providers.length;
+      try { const r=await this.providers[idx][method](...args); this.idx=idx; return r; }
+      catch(err) { if(i===this.providers.length-1) throw err; console.warn(`${this.chainName} RPC[${idx}] failed, trying next`); }
+    }
+  }
+  getBlock(t)              { return this.call("getBlock",t); }
+  getFeeData()             { return this.call("getFeeData"); }
+  getBalance(a)            { return this.call("getBalance",a); }
+  getCode(a)               { return this.call("getCode",a); }
+  getTransactionReceipt(h) { return this.call("getTransactionReceipt",h); }
+  getNetwork()             { return this.call("getNetwork"); }
+  estimateGas(tx)          { return this.call("estimateGas",tx); }
+  getLogs(f)               { return this.call("getLogs",f); }
+}
 
+// ─── BOOT ────────────────────────────────────────────────────────────────────
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN,{polling:true});
+const providers = new Map(Object.values(CHAIN).filter(c=>c.rpcUrls?.length).map(c=>[c.chainId,new FallbackProvider(c.rpcUrls,c.chainId,c.chainName)]));
+const mintTimers      = new Map();
+const mempoolWatchers = new Map();
+const topOfferWatchers= new Map();
+const saleWatchers    = new Map();
 let db = loadDb();
-let pgPool = null;
-let pgSaveInFlight = false;
-let pgSaveQueued = false;
-
 ensureDataDir();
-initRuntime().catch((err) => {
-  console.error("runtime init failed:", err);
-  armAllAutoMintTimers();
-  setInterval(checkConfirmedMints, POLL_INTERVAL_MS);
-});
+armAll();
+setInterval(pollLoop,         POLL_MS);
+setInterval(checkTopOffers,   TOP_OFFER_POLL_MS);
+setInterval(checkSales,       SALE_POLL_MS);
+setInterval(clearExpiredStates,60000);
 
+// ─── COMMANDS ─────────────────────────────────────────────────────────────────
 bot.setMyCommands([
-  { command: "start", description: "Open the home screen" },
-  { command: "track", description: "Track a mint" },
-  { command: "wallet", description: "Open wallet tools" },
-  { command: "ready", description: "Run ready check" },
-  { command: "pnl", description: "Open PnL" },
-  { command: "status", description: "Check active mints" },
-  { command: "gas", description: "Check gas" },
-  { command: "history", description: "See past buys" },
-  { command: "stats", description: "Admin only" },
-  { command: "clear", description: "Clear active mints" },
-  { command: "setwallet", description: "Add a wallet secret" }
-]).catch((err) => console.error("setMyCommands failed:", err.message));
+  {command:"start",   description:"Open MintBot"},
+  {command:"track",   description:"Track a drop"},
+  {command:"wallet",  description:"Wallets"},
+  {command:"status",  description:"Active mints"},
+  {command:"gas",     description:"Gas prices"},
+  {command:"history", description:"History & P&L"},
+  {command:"blast",   description:"Multi-wallet blast"},
+  {command:"reset",   description:"Clear stuck state"},
+  {command:"stats",   description:"Admin only"}
+]).catch(e=>console.error("setMyCommands:",e.message));
 
-bot.onText(/^\/start\b/, async (msg) => {
-  await sendMainMenu(msg.chat.id);
+bot.onText(/^\/start\b/,   async msg=>sendStart(msg.chat.id,msg.from));
+bot.onText(/^\/track\b/,   async msg=>startTrack(msg.chat.id));
+bot.onText(/^\/wallet\b/,  async msg=>sendWalletMenu(msg.chat.id));
+bot.onText(/^\/status\b/,  async msg=>sendStatus(msg.chat.id));
+bot.onText(/^\/gas\b/,     async msg=>sendGas(msg.chat.id));
+bot.onText(/^\/history\b/, async msg=>sendHistory(msg.chat.id));
+bot.onText(/^\/trending\b/, async msg=>sendTrending(msg.chat.id));
+bot.onText(/^\/blast\b/,   async msg=>sendBlastMenu(msg.chat.id));
+bot.onText(/^\/reset\b/,   async msg=>resetState(msg.chat.id));
+bot.onText(/^\/stats\b/,   async msg=>sendAdminStats(msg.chat.id,msg.from.id));
+bot.onText(/^\/setwallet(?:\s+(.+))?$/s, async(msg,match)=>{
+  const chatId=msg.chat.id;
+  await safeDelete(chatId,msg.message_id);
+  const key=(match?.[1]||"").trim();
+  if (!key) { const u=getUser(chatId); u.state={mode:"import_wallet",at:Date.now()}; saveDb(); await send(chatId,"Drop the private key. I'll delete it right after.\n\nUse a dedicated mint wallet — never your main."); return; }
+  await importWallet(chatId,key);
 });
 
-bot.onText(/^\/menu\b/, async (msg) => {
-  await sendMainMenu(msg.chat.id);
+// ─── CALLBACKS ───────────────────────────────────────────────────────────────
+bot.on("callback_query", async query=>{
+  try { await handleCallback(query); }
+  catch(err) { console.error("callback_query:",err); if(query.message) await send(query.message.chat.id,`Something broke: ${shortErr(err)}`); }
 });
-
-bot.onText(/^\/track\b/, async (msg) => {
-  await startTrackFlow(msg.chat.id);
-});
-
-bot.onText(/^\/wallet\b/, async (msg) => {
-  await sendWalletMenu(msg.chat.id);
-});
-
-bot.onText(/^\/ready\b/, async (msg) => {
-  await sendReadyCheck(msg.chat.id);
-});
-
-bot.onText(/^\/pnl\b/, async (msg) => {
-  await sendPnlDashboard(msg.chat.id);
-});
-
-bot.onText(/^\/gas\b/, async (msg) => {
-  await sendGas(msg.chat.id);
-});
-
-bot.onText(/^\/status\b/, async (msg) => {
-  await sendStatus(msg.chat.id);
-});
-
-bot.onText(/^\/history\b/, async (msg) => {
-  await sendMintHistory(msg.chat.id);
-});
-
-bot.onText(/^\/stats\b/, async (msg) => {
-  await sendAdminStats(msg);
-});
-
-bot.onText(/^\/clear\b/, async (msg) => {
-  await clearMints(msg.chat.id);
-});
-
-bot.onText(/^\/setwallet(?:\s+(.+))?$/s, async (msg, match) => {
-  const chatId = msg.chat.id;
-  await safeDelete(chatId, msg.message_id);
-  const privateKey = (match && match[1] ? match[1] : "").trim();
-
-  if (!privateKey) {
-    const user = getUser(chatId);
-    user.state = { mode: "awaiting_import_wallet" };
-    saveDb();
-    await safeSend(chatId, "Send your wallet secret now. Use a fresh mint wallet only. I will delete the message after import.");
-    return;
-  }
-
-  await importWallet(chatId, privateKey, { deleteMessageId: msg.message_id });
-});
-
-bot.on("callback_query", async (query) => {
-  try {
-    await handleCallback(query);
-  } catch (err) {
-    console.error("callback_query error:", err);
-    if (query.message) {
-      await safeSend(query.message.chat.id, userFriendlyError(err));
-    }
-  }
-});
-
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  const text = msg.text.trim();
-  const chatId = msg.chat.id;
-  touchUser(chatId, msg.from);
-
-  if (text.startsWith("/")) return;
-
-  try {
-    if (await handleMenuText(chatId, text)) return;
-
-    const user = getUser(chatId);
-    if (user.state && user.state.mode === "awaiting_import_wallet") {
-      await safeDelete(chatId, msg.message_id);
-      await importWallet(chatId, text, { deleteMessageId: msg.message_id });
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_track_input") {
-      await handleTrackInput(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_instant_target") {
-      await handleInstantMintInput(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_send_token") {
-      await handleSendTokenDetails(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_send_token_destination") {
-      await handleSendTokenDestination(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_send_nft_destination") {
-      await handleSendNftDestination(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_gas_cap_custom") {
-      await handleCustomGasCap(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_target_list_price") {
-      await handleTargetListPrice(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_list_price") {
-      await handleListPrice(chatId, text);
-      return;
-    }
-
-    if (user.state && user.state.mode === "awaiting_profit_threshold") {
-      await handleProfitThreshold(chatId, text);
-      return;
-    }
-
-    if (looksLikeMintMessage(text)) {
-      await handleTrackInput(chatId, text);
-      return;
-    }
-
-    logUnhandled(chatId, "unrecognized_input", text);
-    await safeSend(
-      chatId,
-      "Send a mint page or use Track Mint from the menu.",
-      MAIN_MENU_KEYBOARD
-    );
-  } catch (err) {
-    console.error("message handler error:", err);
-    await safeSend(chatId, userFriendlyError(err, "I could not process that. Try again from the menu."));
-  }
-});
-
-bot.on("polling_error", (err) => {
-  console.error("polling_error:", err.message);
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("unhandledRejection:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("uncaughtException:", err);
-});
-
-async function initRuntime() {
-  await initPostgresStorage();
-  armAllAutoMintTimers();
-  setInterval(checkConfirmedMints, POLL_INTERVAL_MS);
-  startWebhookServer();
-  console.log("MintBot running.");
-}
-
-async function initPostgresStorage() {
-  if (!process.env.DATABASE_URL) return;
-
-  let Pool;
-  try {
-    ({ Pool } = require("pg"));
-  } catch (err) {
-    console.error("DATABASE_URL is set but pg is not installed. Run npm install.");
-    return;
-  }
-
-  pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false }
-  });
-
-  await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS mintbot_state (
-      id TEXT PRIMARY KEY,
-      data JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  const result = await pgPool.query("SELECT data FROM mintbot_state WHERE id = $1", ["default"]);
-  if (result.rows[0] && result.rows[0].data) {
-    db = result.rows[0].data;
-    db.users = db.users || {};
-  } else {
-    await persistDbToPostgres();
-  }
-  console.log("PostgreSQL storage active.");
-}
-
-function startWebhookServer() {
-  if (!process.env.ENABLE_WEBHOOK_SERVER && !process.env.DATABASE_URL) return;
-
-  const server = http.createServer(async (req, res) => {
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-
-    if (req.method !== "POST" || !String(req.url || "").startsWith("/webhooks/alchemy")) {
-      res.writeHead(404);
-      res.end("not found");
-      return;
-    }
-
-    if (ALCHEMY_WEBHOOK_AUTH_TOKEN && req.headers["x-mintbot-token"] !== ALCHEMY_WEBHOOK_AUTH_TOKEN) {
-      res.writeHead(401);
-      res.end("unauthorized");
-      return;
-    }
-
-    try {
-      const payload = await readRequestJson(req);
-      await handleAlchemyWebhook(payload);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-    } catch (err) {
-      console.error("webhook error:", err);
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: shortError(err) }));
-    }
-  });
-
-  server.listen(WEBHOOK_PORT, () => {
-    console.log(`Webhook server listening on ${WEBHOOK_PORT}`);
-  });
-}
-
-function readRequestJson(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 2_000_000) {
-        req.destroy();
-        reject(new Error("Webhook payload too large"));
-      }
-    });
-    req.on("end", () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
-        reject(new Error("Invalid webhook JSON"));
-      }
-    });
-    req.on("error", reject);
-  });
-}
-
-async function handleMenuText(chatId, text) {
-  const normalized = text.toLowerCase();
-
-  if (normalized === "menu") {
-    await sendMainMenu(chatId);
-    return true;
-  }
-  if (normalized === "wallet") {
-    await sendWalletMenu(chatId);
-    return true;
-  }
-  if (normalized === "fund wallet") {
-    await sendFundWallet(chatId);
-    return true;
-  }
-  if (normalized === "ready check") {
-    await sendReadyCheck(chatId);
-    return true;
-  }
-  if (normalized === "pnl") {
-    await sendPnlDashboard(chatId);
-    return true;
-  }
-  if (normalized === "track nft" || normalized === "track mint") {
-    await startTrackFlow(chatId);
-    return true;
-  }
-  if (normalized === "instant mint") {
-    await startInstantMintFlow(chatId);
-    return true;
-  }
-  if (normalized === "receive") {
-    await sendReceiveAddress(chatId);
-    return true;
-  }
-  if (normalized === "send nft") {
-    await startSendNftFlow(chatId);
-    return true;
-  }
-  if (normalized === "send token") {
-    await startSendTokenFlow(chatId);
-    return true;
-  }
-  if (normalized === "auto-mint" || normalized === "auto-buy") {
-    await sendAutoMintPanel(chatId);
-    return true;
-  }
-  if (normalized === "reminders") {
-    await sendRemindersPanel(chatId);
-    return true;
-  }
-  if (normalized === "gas") {
-    await sendGas(chatId);
-    return true;
-  }
-  if (normalized === "trending") {
-    await sendTrending(chatId);
-    return true;
-  }
-  if (normalized === "portfolio") {
-    await sendPortfolio(chatId);
-    return true;
-  }
-  if (normalized === "status") {
-    await sendStatus(chatId);
-    return true;
-  }
-  if (normalized === "mint history" || normalized === "buy history") {
-    await sendMintHistory(chatId);
-    return true;
-  }
-
-  return false;
-}
 
 async function handleCallback(query) {
-  const data = query.data || "";
-  const chatId = query.message.chat.id;
-  const messageId = query.message.message_id;
-  const user = getUser(chatId);
-  touchUser(chatId, query.from);
-  logFeature(user, data.split(":")[0] || "callback");
+  const data=query.data||""; const chatId=query.message.chat.id; const msgId=query.message.message_id; const user=getUser(chatId);
+  await bot.answerCallbackQuery(query.id).catch(()=>{});
 
-  await bot.answerCallbackQuery(query.id).catch(() => {});
+  if (data==="start")            { await sendStart(chatId,query.from); return; }
+  if (data==="track:start")      { await startTrack(chatId); return; }
+  if (data==="wallet:menu")      { await sendWalletMenu(chatId); return; }
+  if (data==="leaderboard")      { await sendLeaderboard(chatId); return; }
+  if (data==="trending")         { await sendTrending(chatId); return; }
+  if (data==="blast:menu")       { await sendBlastMenu(chatId); return; }
+  if (data==="instant_mint")     { await promptInstantMint(chatId); return; }
+  if (data==="wallet:create")    { await createWallet(chatId); return; }
+  if (data==="wallet:import")    { user.state={mode:"import_wallet",at:Date.now()}; saveDb(); await send(chatId,"Drop the private key. I'll delete it right after.\n\nUse a dedicated mint wallet — never your main."); return; }
+  if (data==="wallet:list")      { await sendWalletList(chatId); return; }
+  if (data==="wallet:export")    { await sendExportMenu(chatId); return; }
+  if (data==="wallet:receive")   { await showReceive(chatId); return; }
+  if (data==="wallet:send_nft")  { await startSendNft(chatId); return; }
+  if (data==="wallet:send_token"){ await startSendToken(chatId); return; }
+  if (data==="gas:refresh")      { await sendGas(chatId,{editId:msgId}); return; }
+  if (data==="gas:toggle_war")   { user.gasWarMode=!user.gasWarMode; saveDb(); await sendGas(chatId,{editId:msgId}); return; }
 
-  if (data === "menu") {
-    await sendMainMenu(chatId);
-    return;
+  if (data.startsWith("wallet:switch:"))     { await switchWallet(chatId,data.split(":")[2]); return; }
+  if (data.startsWith("wallet:export_warn:")){ await sendExportWarning(chatId,data.split(":")[2]); return; }
+  if (data.startsWith("wallet:export_ok:")) { await exportWallet(chatId,data.split(":")[2]); return; }
+  if (data.startsWith("stage:"))            { await verifyAndBuildMint(chatId,{...(user.state?.draft||{}),userTier:data.split(":")[1]}); return; }
+
+  if (data.startsWith("confirm:"))           { await confirmMint(chatId,data.split(":")[1]); return; }
+  if (data.startsWith("cancel_pending:")) {
+    const id=data.split(":")[1];
+    if (user.pendingMint?.id===id) { user.pendingMint=null; user.state={}; saveDb(); }
+    await safeEdit(chatId,msgId,"Cancelled. Drop a new URL whenever you're ready."); return;
   }
-
-  if (data === "track:start") {
-    await startTrackFlow(chatId);
-    return;
-  }
-
-  if (data === "leaderboard") {
-    await sendLeaderboard(chatId);
-    return;
-  }
-
-  if (data === "status:open") {
-    await sendStatus(chatId);
-    return;
-  }
-
-  if (data === "instant:start") {
-    await startInstantMintFlow(chatId);
-    return;
-  }
-
-  if (data === "receive") {
-    await sendReceiveAddress(chatId);
-    return;
-  }
-
-  if (data === "fund:wallet") {
-    await sendFundWallet(chatId);
-    return;
-  }
-
-  if (data === "ready:check") {
-    await sendReadyCheck(chatId);
-    return;
-  }
-
-  if (data === "pnl:show") {
-    await sendPnlDashboard(chatId);
-    return;
-  }
-
-  if (data === "riskmode:panel") {
-    await sendRiskModePanel(chatId);
-    return;
-  }
-
-  if (data.startsWith("riskmode:set:")) {
-    const mode = data.split(":")[2];
-    await setRiskMode(chatId, mode);
-    return;
-  }
-
-  if (data === "sendtoken:start") {
-    await startSendTokenFlow(chatId);
-    return;
-  }
-
-  if (data === "sendnft:start") {
-    await startSendNftFlow(chatId);
-    return;
-  }
-
-  if (data === "wallet:menu") {
-    await sendWalletMenu(chatId);
-    return;
-  }
-
-  if (data === "wallet:create") {
-    await createWallet(chatId);
-    return;
-  }
-
-  if (data === "wallet:import") {
-    user.state = { mode: "awaiting_import_wallet" };
-    saveDb();
-    await safeSend(chatId, "Send your wallet secret to import. Use a fresh mint wallet only. I will delete the message after import.");
-    return;
-  }
-
-  if (data === "wallet:list") {
-    await sendWalletList(chatId);
-    return;
-  }
-
-  if (data === "wallet:export") {
-    await sendExportWalletMenu(chatId);
-    return;
-  }
-
-  if (data.startsWith("wallet:switch:")) {
-    const walletId = data.split(":")[2];
-    await switchWallet(chatId, walletId);
-    return;
-  }
-
-  if (data.startsWith("wallet:export_warn:")) {
-    const walletId = data.split(":")[2];
-    await sendExportWalletWarning(chatId, walletId);
-    return;
-  }
-
-  if (data.startsWith("wallet:export_confirm:")) {
-    const walletId = data.split(":")[2];
-    await exportWallet(chatId, walletId);
-    return;
-  }
-
-  if (data === "gas:refresh") {
-    await sendGas(chatId, { editMessageId: messageId });
-    return;
-  }
-
-  if (data === "gaswar:toggle") {
-    user.gasWarMode = !user.gasWarMode;
-    user.updatedAt = Date.now();
-    saveDb();
-    await sendGas(chatId, { editMessageId: messageId });
-    return;
-  }
-
-  if (data.startsWith("stage:")) {
-    const tier = data.split(":")[1];
-    await verifyAndCreatePendingMint(chatId, {
-      ...(user.state && user.state.draft ? user.state.draft : {}),
-      userTier: tier
-    });
-    return;
-  }
-
-  if (data.startsWith("confirm:")) {
-    const mintId = data.split(":")[1];
-    await askGasCapApproval(chatId, mintId);
-    return;
-  }
-
-  if (data.startsWith("gascap:approve:")) {
-    const mintId = data.split(":")[2];
-    await approveRecommendedGasCap(chatId, mintId);
-    return;
-  }
-
-  if (data.startsWith("gascap:custom:")) {
-    const mintId = data.split(":")[2];
-    user.state = { mode: "awaiting_gas_cap_custom", mintId };
-    saveDb();
-    await safeSend(chatId, "Reply with the most you want this bot to spend on gas for this buy. Example: 0.012 ETH");
-    return;
-  }
-
-  if (data.startsWith("cancel:")) {
-    const mintId = data.split(":")[1];
-    if (user.pendingMint && user.pendingMint.id === mintId) {
-      user.pendingMint = null;
-      user.state = {};
-      saveDb();
-    }
-    await safeEdit(chatId, messageId, "That setup is cancelled. Send a new mint page when you want to try again.");
-    return;
-  }
-
   if (data.startsWith("toggle:")) {
-    const [, field, mintId] = data.split(":");
-    if (!user.pendingMint || user.pendingMint.id !== mintId) {
-      await safeSend(chatId, "That setup expired. Start again with a fresh mint page.");
-      return;
-    }
-
-    if (field === "reminders") {
-      user.pendingMint.remindersEnabled = !user.pendingMint.remindersEnabled;
-    } else if (field === "auto") {
-      user.pendingMint.autoMintEnabled = !user.pendingMint.autoMintEnabled;
-    } else if (field === "flashbots") {
-      user.pendingMint.flashbotsEnabled = !user.pendingMint.flashbotsEnabled;
-    } else if (field === "gaswar") {
-      user.gasWarMode = !user.gasWarMode;
-      user.pendingMint.gasWarMode = user.gasWarMode;
-    }
-
-    user.pendingMint.updatedAt = Date.now();
-    saveDb();
-    await safeEdit(chatId, messageId, formatMintCard(chatId, user.pendingMint), {
-      reply_markup: mintConfirmKeyboard(user.pendingMint)
-    });
+    const [,field,id]=data.split(":");
+    if (!user.pendingMint||user.pendingMint.id!==id) { await send(chatId,"This mint setup expired. Start fresh."); return; }
+    const m=user.pendingMint;
+    if (field==="reminders") m.remindersEnabled=!m.remindersEnabled;
+    if (field==="auto")      m.autoMintEnabled=!m.autoMintEnabled;
+    if (field==="gaswar")    m.gasWarMode=!m.gasWarMode;
+    if (field==="flashbots") m.flashbotsEnabled=!m.flashbotsEnabled;
+    m.updatedAt=Date.now(); saveDb();
+    await safeEdit(chatId,msgId,mintCard(chatId,m),{reply_markup:mintKeyboard(m)}); return;
+  }
+  if (data.startsWith("set_gas_cap:")) {
+    const id=data.split(":")[1];
+    if (!user.pendingMint||user.pendingMint.id!==id) { await send(chatId,"Mint setup expired."); return; }
+    user.state={mode:"gas_cap",mintId:id,ctx:"pending",at:Date.now()}; saveDb();
+    await send(chatId,`Gas cap — estimated at ${user.pendingMint._estCap||"?"} ETH.\n\nReply with your max in ETH, or "ok" to accept.`); return;
+  }
+  if (data.startsWith("set_target_list:"))   { user.state={mode:"target_list",mintId:data.split(":")[1],at:Date.now()}; saveDb(); await send(chatId,"Target list price in ETH — I'll alert you when the floor hits it.\n\nReply with a number (e.g. 0.5)."); return; }
+  if (data.startsWith("set_profit_alert:"))  { user.state={mode:"profit_alert",mintId:data.split(":")[1],at:Date.now()}; saveDb(); await send(chatId,"Starting profit multiple for alerts (default: 2x).\n\nReply with a number (e.g. 3 = alert at 3x, 4x, 5x...)."); return; }
+  if (data.startsWith("cancel_mint:")) {
+    const id=data.split(":")[1]; const mint=(user.mints||[]).find(m=>m.id===id);
+    if (mint) { clearMintTimer(chatId,id); stopMempoolWatcher(id); stopTopOfferWatcher(chatId,id); stopSaleWatcher(chatId,id); mint.completedAt=Date.now(); mint.cancelledManually=true; saveDb(); await send(chatId,`Cancelled: ${mint.mintName}.\n\nWatchers stopped.`); }
     return;
   }
-
-  if (data.startsWith("mint_toggle:")) {
-    const [, field, mintId] = data.split(":");
-    await toggleConfirmedMintSetting(chatId, field, mintId);
-    return;
-  }
-
-  if (data.startsWith("status_instant:")) {
-    const mintId = data.split(":")[1];
-    await instantMintExisting(chatId, mintId);
-    return;
-  }
-
-  if (data.startsWith("mint_cancel:")) {
-    const mintId = data.split(":")[1];
-    await cancelConfirmedMint(chatId, mintId);
-    return;
-  }
-
-  if (data.startsWith("sendnft:pick:")) {
-    const nftId = data.split(":")[2];
-    await pickNftToSend(chatId, nftId);
-    return;
-  }
-
-  if (data.startsWith("target_list:")) {
-    const mintId = data.split(":")[1];
-    user.state = { mode: "awaiting_target_list_price", mintId };
-    saveDb();
-    await safeSend(chatId, "Reply with the sell price you want if this runs. Example: 0.25 ETH");
-    return;
-  }
-
-  if (data.startsWith("token_rarity:")) {
-    const tokenRecordId = data.split(":")[1];
-    await sendMintedTokenMarketCard(chatId, tokenRecordId, { refresh: true });
-    return;
-  }
-
-  if (data.startsWith("token_list:")) {
-    const tokenRecordId = data.split(":")[1];
-    const token = findMintedToken(user, tokenRecordId);
-    if (!token) {
-      await safeSend(chatId, "That item is not available in this chat anymore. Open your wallet or buy history and try again.");
-      return;
-    }
-    user.state = { mode: "awaiting_list_price", tokenRecordId };
-    saveDb();
-    await safeSend(
-      chatId,
-      [
-        "List for Sale",
-        `Item: ${displayMintedTokenName(token)}`,
-        "",
-        "Reply with the sell price you want.",
-        "Example: 0.25 ETH"
-      ].join("\n")
-    );
-    return;
-  }
-
-  if (data.startsWith("profit_threshold:")) {
-    const mintId = data.split(":")[1];
-    user.state = { mode: "awaiting_profit_threshold", mintId };
-    saveDb();
-    await safeSend(chatId, "Reply with when you want the bot to ping you for profit. Example: 2 for 2x or 3 for 3x.");
-    return;
-  }
-
-  if (data.startsWith("track_collection:")) {
-    const slug = data.replace("track_collection:", "");
-    await handleTrackInput(chatId, `https://opensea.io/collection/${slug}`);
-    return;
-  }
+  if (data.startsWith("instant_mint:")) { const id=data.split(":")[1]; const m=(user.mints||[]).find(x=>x.id===id); if(m) await doInstantMint(chatId,m); return; }
+  if (data.startsWith("watch_offer:")) { const id=data.split(":")[1]; const m=(user.mints||[]).find(x=>x.id===id); if(m){startTopOfferWatcher(chatId,m); await send(chatId,`Watching ${m.mintName}.\nAlerts at 2x, 3x, 4x profit and at -50%, -75%.`);} return; }
+  if (data.startsWith("stop_watching:")) { const parts=data.split(":"); const id=parts.length===3?parts[2]:parts[1]; stopTopOfferWatcher(chatId,id); await send(chatId,"Stopped. Restart from Status."); return; }
+  if (data.startsWith("list_for_sale:"))  { user.state={mode:"list_price",mintId:data.split(":")[1],at:Date.now()}; saveDb(); await send(chatId,"List price in ETH?\n\nReply with a number (e.g. 0.5)."); return; }
+  if (data.startsWith("view_rarity:"))    { const [,id,tok]=data.split(":"); const m=(user.mints||[]).find(x=>x.id===id); if(m) await showRarity(chatId,m,tok); return; }
+  if (data.startsWith("accept_offer:"))   { await send(chatId,"Accept the offer directly on OpenSea — open the NFT page and tap Accept Offer."); return; }
+  if (data.startsWith("blast:confirm:"))  { await executeBlast(chatId,data.split(":")[2]); return; }
+  if (data.startsWith("track_slug:"))     { await handleTrackInput(chatId,`https://opensea.io/collection/${data.split(":")[1]}`); return; }
 }
 
-async function sendMainMenu(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-  const activeWalletLine = wallet ? `Live wallet: ${shortAddress(wallet.address)}` : "Live wallet: not set";
-  const activeMints = (user.mints || []).filter((mint) => mint.confirmed && !mint.completedAt).length;
-  const riskMode = riskModeForUser(user);
+// ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
+bot.on("message", async msg=>{
+  if (!msg.text) return;
+  const text=msg.text.trim(); const chatId=msg.chat.id;
+  saveProfile(chatId,msg.from);
+  if (text.startsWith("/")) return;
+  try {
+    const lower=text.toLowerCase();
+    if (lower==="track")    { await startTrack(chatId);     return; }
+    if (lower==="wallet")   { await sendWalletMenu(chatId); return; }
+    if (lower==="status")   { await sendStatus(chatId);     return; }
+    if (lower==="gas")      { await sendGas(chatId);        return; }
+    if (lower==="history")  { await sendHistory(chatId);    return; }
+    if (lower==="trending") { await sendTrending(chatId);   return; }
 
-  await safeSend(
-    chatId,
-    [
-      "MintBot",
-      activeWalletLine,
-      `Live mints: ${activeMints}`,
-      `Mode: ${riskMode.label}`,
+    const user=getUser(chatId);
+    if (user.state?.mode==="import_wallet")        { await safeDelete(chatId,msg.message_id); await importWallet(chatId,text); return; }
+    if (user.state?.mode==="track_input")          { await handleTrackInput(chatId,text); return; }
+    if (user.state?.mode==="gas_cap")              { await handleGasCap(chatId,text,user.state); return; }
+    if (user.state?.mode==="instant_url")          { await doInstantMintFromUrl(chatId,text); return; }
+    if (user.state?.mode==="send_nft_id")          { await handleSendNftId(chatId,text,user.state); return; }
+    if (user.state?.mode==="send_nft_to")          { await handleSendNftTo(chatId,text,user.state); return; }
+    if (user.state?.mode==="send_token_contract")  { await handleSendTokenContract(chatId,text); return; }
+    if (user.state?.mode==="send_token_amount")    { await handleSendTokenAmount(chatId,text,user.state); return; }
+    if (user.state?.mode==="send_token_to")        { await handleSendTokenTo(chatId,text,user.state); return; }
+    if (user.state?.mode==="list_price")           { await handleListPrice(chatId,text,user.state); return; }
+    if (user.state?.mode==="target_list")          { await handleTargetList(chatId,text,user.state); return; }
+    if (user.state?.mode==="profit_alert")         { await handleProfitAlert(chatId,text,user.state); return; }
+    if (user.state?.mode==="blast_url")            { await handleBlastUrl(chatId,text); return; }
+    if (looksLikeMint(text)) { await handleTrackInput(chatId,text); return; }
+    logUnhandled(chatId,text);
+    await send(chatId,"Drop an OpenSea URL to track a mint, or use the menu.",KEYBOARD);
+  } catch(err) { console.error("message handler:",err); await send(chatId,`Hit an error: ${shortErr(err)}`); }
+});
+
+bot.on("polling_error", err=>console.error("polling:",err.message));
+process.on("unhandledRejection", err=>console.error("unhandledRejection:",err));
+process.on("uncaughtException",  err=>console.error("uncaughtException:",err));
+
+// ─── START / DASHBOARD ───────────────────────────────────────────────────────
+async function sendStart(chatId,from) {
+  saveProfile(chatId,from);
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  const isNew=!wallet&&!(user.wallets||[]).length;
+  const name=from?.first_name||null;
+  const activeMints=(user.mints||[]).filter(m=>m.confirmed&&!m.completedAt).length;
+
+  if (isNew) {
+    await send(chatId,[
+      name?`${name}.`:"You're in.",
       "",
-      "Best way to use this:",
-      "1. Add a wallet",
-      "2. Drop an OpenSea mint page",
-      "3. Confirm the details",
-      "4. Let the bot handle the timing",
+      "Most people miss drops because they're too slow.",
+      "MintBot fires the moment your window opens — before most wallets even send.",
       "",
-      "Example: https://opensea.io/collection/example"
-    ].join("\n"),
-    MAIN_MENU_KEYBOARD
-  );
+      "One thing standing between you and your first mint: a wallet.",
+      "Takes 30 seconds."
+    ].join("\n"),{reply_markup:{inline_keyboard:[
+      [{text:"⚡ Create Wallet — 30 seconds",callback_data:"wallet:create"}],
+      [{text:"🔑 Import Existing Wallet",callback_data:"wallet:import"}]
+    ]}});
+    return;
+  }
 
-  await safeSend(
-    chatId,
-    [
-      "Quick Actions",
-      "Instant Mint buys right now from your live wallet.",
-      "Fund Wallet shows your address, QR, and how short you are for the next buy.",
-      "Ready Check tells you if you're actually set.",
-      "Receive shows where people should send you funds or NFTs.",
-      "Send NFT and Send Token move things out of your live wallet.",
-      "Winners shows who is actually winning."
-    ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Instant Mint", callback_data: "instant:start" },
-            { text: "Receive", callback_data: "receive" }
-          ],
-          [
-            { text: "Fund Wallet", callback_data: "fund:wallet" },
-            { text: "Ready Check", callback_data: "ready:check" }
-          ],
-          [
-            { text: "Send NFT", callback_data: "sendnft:start" },
-            { text: "Send Token", callback_data: "sendtoken:start" }
-          ],
-          [
-            { text: "PnL", callback_data: "pnl:show" },
-            { text: `Mode: ${riskMode.label}`, callback_data: "riskmode:panel" }
-          ],
-          [{ text: "Winners", callback_data: "leaderboard" }]
-        ]
-      }
-    }
-  );
-}
-
-async function sendWalletMenu(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-  const lines = [
-    "Wallet",
-    wallet ? `Live: ${shortAddress(wallet.address)}` : "Live: not set",
-    `Saved wallets: ${(user.wallets || []).length}`,
+  const bal=await quickBalance(wallet);
+  const pnl=getPnL(user);
+  await send(chatId,[
+    name?`${name}.`:"Back.",
     "",
-    "Use a dedicated mint wallet. Keep only what you need inside it."
-  ];
-
-  await safeSend(chatId, lines.join("\n"), {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "Create Wallet", callback_data: "wallet:create" }],
-        [{ text: "Import Wallet", callback_data: "wallet:import" }],
-        [{ text: "Switch Wallet", callback_data: "wallet:list" }],
-        [{ text: "Export Wallet", callback_data: "wallet:export" }],
-        [{ text: "Fund Wallet", callback_data: "fund:wallet" }],
-        [
-          { text: "Receive", callback_data: "receive" },
-          { text: "Send NFT", callback_data: "sendnft:start" }
-        ],
-        [{ text: "Send Token", callback_data: "sendtoken:start" }]
-      ]
-    }
+    `💼 ${shortAddr(wallet.address)}  ${bal}`,
+    activeMints?`🎯 ${activeMints} mint${activeMints>1?"s":""} armed.`:"Nothing armed.",
+    pnl.totalMints?`📈 ${pnl.totalMints} mints  |  net ${pnl.net>=0?"+":""}${pnl.net.toFixed(4)} ETH`:"",
+    "",
+    "What's next?"
+  ].filter(l=>l!=="").join("\n"),{
+    reply_markup:{inline_keyboard:[
+      [{text:"📊 Track a Drop",callback_data:"track:start"},{text:"⚡ Instant Mint",callback_data:"instant_mint"}],
+      [{text:"📤 Send NFT",callback_data:"wallet:send_nft"},{text:"📥 Receive",callback_data:"wallet:receive"}],
+      [{text:"🏆 Leaderboard",callback_data:"leaderboard"},{text:"🔥 Trending",callback_data:"trending"}],
+      [{text:"💣 Blast Mint",callback_data:"blast:menu"}]
+    ]},
+    ...KEYBOARD
   });
+}
+
+// ─── WALLET ───────────────────────────────────────────────────────────────────
+async function sendWalletMenu(chatId) {
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  const bal=wallet?await quickBalance(wallet):"";
+  await send(chatId,[
+    "Your Wallets","",
+    wallet?`Active: ${shortAddr(wallet.address)}  ${bal}`:"No wallet set.",
+    `Total: ${(user.wallets||[]).length}`,
+    "",
+    "Use a dedicated mint wallet. Keep only what you need for minting."
+  ].join("\n"),{reply_markup:{inline_keyboard:[
+    [{text:"➕ Create New Wallet",callback_data:"wallet:create"}],
+    [{text:"🔑 Import Wallet",callback_data:"wallet:import"}],
+    [{text:"🔄 Switch Wallet",callback_data:"wallet:list"}],
+    [{text:"🔐 Export Key",callback_data:"wallet:export"}],
+    [{text:"📥 Receive",callback_data:"wallet:receive"},{text:"📤 Send NFT",callback_data:"wallet:send_nft"}],
+    [{text:"🪙 Send Token",callback_data:"wallet:send_token"}]
+  ]}});
 }
 
 async function createWallet(chatId) {
-  if (!walletEncryptionReady()) {
-    await safeSend(chatId, "Wallet creation is down right now. Try again in a moment.");
-    return;
-  }
-
-  const user = getUser(chatId);
-  const wallet = ethers.Wallet.createRandom();
-  const walletRecord = {
-    id: randomId(8),
-    name: `Wallet ${(user.wallets || []).length + 1}`,
-    address: wallet.address,
-    encryptedPrivateKey: encryptPrivateKey(wallet.privateKey),
-    createdAt: Date.now()
-  };
-
-  user.wallets = user.wallets || [];
-  user.wallets.push(walletRecord);
-  user.activeWalletId = walletRecord.id;
-  saveDb();
-
-  const privateKeyMsg = await safeSend(
-    chatId,
-    [
-      "New wallet ready.",
-      `Address: ${wallet.address}`,
-      "",
-      "Secret key below. Save it now. This message will disappear in 30 seconds.",
-      wallet.privateKey
-    ].join("\n")
-  );
-
-  if (privateKeyMsg && privateKeyMsg.message_id) {
-    setTimeout(() => safeDelete(chatId, privateKeyMsg.message_id), 30000);
-  }
-
-  await safeSend(chatId, `Done. Your live wallet is now ${shortAddress(wallet.address)}.`, MAIN_MENU_KEYBOARD);
-  armAllAutoMintTimers();
+  if (!encReady()) { await send(chatId,"WALLET_ENCRYPTION_KEY not set. Add it to .env first."); return; }
+  const user=getUser(chatId); const w=ethers.Wallet.createRandom();
+  const record={id:uid(8),name:`Wallet ${(user.wallets||[]).length+1}`,address:w.address,encKey:encryptKey(w.privateKey),createdAt:Date.now()};
+  user.wallets=user.wallets||[]; user.wallets.push(record); user.activeWalletId=record.id; saveDb();
+  const msg=await send(chatId,[`Wallet created.`,``,`Address: ${w.address}`,``,`Private key — save this now. Deletes in 30 seconds:`,``,w.privateKey].join("\n"));
+  if (msg?.message_id) setTimeout(()=>safeDelete(chatId,msg.message_id),30000);
+  await send(chatId,`Active: ${shortAddr(w.address)}\n\nNow track a drop.`,KEYBOARD);
 }
 
-async function importWallet(chatId, privateKey) {
-  if (!walletEncryptionReady()) {
-    await safeSend(chatId, "Wallet import is down right now. Try again in a moment.");
-    return;
-  }
-
-  const user = getUser(chatId);
-  user.state = {};
-
-  let wallet;
-  try {
-    const normalizedKey = normalizePrivateKey(privateKey);
-    wallet = new ethers.Wallet(normalizedKey);
-    privateKey = normalizedKey;
-  } catch (err) {
-    saveDb();
-    await safeSend(chatId, "That secret key does not look right. Try again.");
-    return;
-  }
-
-  user.wallets = user.wallets || [];
-  const existing = user.wallets.find((item) => item.address.toLowerCase() === wallet.address.toLowerCase());
-  if (existing) {
-    existing.encryptedPrivateKey = encryptPrivateKey(privateKey);
-    existing.updatedAt = Date.now();
-    user.activeWalletId = existing.id;
-  } else {
-    user.wallets.push({
-      id: randomId(8),
-      name: `Wallet ${user.wallets.length + 1}`,
-      address: wallet.address,
-      encryptedPrivateKey: encryptPrivateKey(privateKey),
-      createdAt: Date.now()
-    });
-    user.activeWalletId = user.wallets[user.wallets.length - 1].id;
-  }
-
+async function importWallet(chatId,rawKey) {
+  if (!encReady()) { await send(chatId,"WALLET_ENCRYPTION_KEY not set in .env."); return; }
+  const user=getUser(chatId); user.state={};
+  let w;
+  try { w=new ethers.Wallet(normKey(rawKey)); rawKey=normKey(rawKey); }
+  catch { saveDb(); await send(chatId,"Invalid private key.\n\nTry /setwallet again."); return; }
+  user.wallets=user.wallets||[];
+  const ex=user.wallets.find(x=>x.address.toLowerCase()===w.address.toLowerCase());
+  if (ex) { ex.encKey=encryptKey(rawKey); ex.updatedAt=Date.now(); user.activeWalletId=ex.id; }
+  else { const r={id:uid(8),name:`Wallet ${user.wallets.length+1}`,address:w.address,encKey:encryptKey(rawKey),createdAt:Date.now()}; user.wallets.push(r); user.activeWalletId=r.id; }
   saveDb();
-  await safeSend(chatId, `Wallet added. You are now using ${shortAddress(wallet.address)}.`, MAIN_MENU_KEYBOARD);
-  armAllAutoMintTimers();
+  await send(chatId,`Imported and set active:\n${shortAddr(w.address)}\n\nTrack a drop to start.`,KEYBOARD);
 }
 
 async function sendWalletList(chatId) {
-  const user = getUser(chatId);
-  const wallets = user.wallets || [];
-
-  if (!wallets.length) {
-    await safeSend(chatId, "You do not have any saved wallets yet.", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Create New Wallet", callback_data: "wallet:create" }],
-          [{ text: "Import Wallet", callback_data: "wallet:import" }]
-        ]
-      }
-    });
-    return;
-  }
-
-  const buttons = wallets.map((wallet) => [{
-    text: `${wallet.id === user.activeWalletId ? "[active] " : ""}${shortAddress(wallet.address)}`,
-    callback_data: `wallet:switch:${wallet.id}`
-  }]);
-
-  await safeSend(chatId, "Pick the wallet you want to use right now:", {
-    reply_markup: { inline_keyboard: buttons }
-  });
+  const user=getUser(chatId); const wallets=user.wallets||[];
+  if (!wallets.length) { await send(chatId,"No wallets yet.",{reply_markup:{inline_keyboard:[[{text:"Create Wallet",callback_data:"wallet:create"}]]}}); return; }
+  await send(chatId,"Select active wallet:",{reply_markup:{inline_keyboard:wallets.map(w=>[{text:`${w.id===user.activeWalletId?"✓ ":""}${shortAddr(w.address)}`,callback_data:`wallet:switch:${w.id}`}])}});
 }
 
-async function sendExportWalletMenu(chatId) {
-  const user = getUser(chatId);
-  const wallets = user.wallets || [];
-
-  if (!wallets.length) {
-    await safeSend(chatId, "You do not have any saved wallets yet.", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Create New Wallet", callback_data: "wallet:create" }],
-          [{ text: "Import Wallet", callback_data: "wallet:import" }]
-        ]
-      }
-    });
-    return;
-  }
-
-  const buttons = wallets.map((wallet) => [{
-    text: `${wallet.id === user.activeWalletId ? "[active] " : ""}${shortAddress(wallet.address)}`,
-    callback_data: `wallet:export_warn:${wallet.id}`
-  }]);
-
-  await safeSend(chatId, "Pick the wallet you want to reveal:", {
-    reply_markup: { inline_keyboard: buttons }
-  });
+async function sendExportMenu(chatId) {
+  const user=getUser(chatId); const wallets=user.wallets||[];
+  if (!wallets.length) { await send(chatId,"No wallets to export."); return; }
+  await send(chatId,"Which wallet?",{reply_markup:{inline_keyboard:wallets.map(w=>[{text:`${w.id===user.activeWalletId?"✓ ":""}${shortAddr(w.address)}`,callback_data:`wallet:export_warn:${w.id}`}])}});
 }
 
-async function sendExportWalletWarning(chatId, walletId) {
-  const user = getUser(chatId);
-  const wallet = (user.wallets || []).find((item) => item.id === walletId);
-
-  if (!wallet) {
-    await safeSend(chatId, "I couldn't find that wallet.");
-    return;
-  }
-
-  await safeSend(
-    chatId,
-    [
-      "Reveal Wallet",
-      `Address: ${wallet.address}`,
-      "",
-      "This reveals the secret key. Anyone with it can drain the wallet.",
-      "The key message disappears in 30 seconds."
-    ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Reveal Secret Key", callback_data: `wallet:export_confirm:${wallet.id}` }],
-          [{ text: "Cancel", callback_data: "wallet:menu" }]
-        ]
-      }
-    }
-  );
+async function sendExportWarning(chatId,walletId) {
+  const user=getUser(chatId); const wallet=(user.wallets||[]).find(w=>w.id===walletId);
+  if (!wallet) { await send(chatId,"Wallet not found."); return; }
+  await send(chatId,`Export: ${shortAddr(wallet.address)}\n\nAnyone who sees this key owns this wallet.\nDeletes in 30 seconds.`,
+    {reply_markup:{inline_keyboard:[[{text:"Show Key",callback_data:`wallet:export_ok:${wallet.id}`}],[{text:"Cancel",callback_data:"wallet:menu"}]]}});
 }
 
-async function exportWallet(chatId, walletId) {
-  const user = getUser(chatId);
-  const wallet = (user.wallets || []).find((item) => item.id === walletId);
+async function exportWallet(chatId,walletId) {
+  const user=getUser(chatId); const wallet=(user.wallets||[]).find(w=>w.id===walletId);
+  if (!wallet?.encKey) { await send(chatId,"Can't export this wallet."); return; }
+  let key; try { key=decryptKey(wallet.encKey); } catch { await send(chatId,"Decryption failed. Check WALLET_ENCRYPTION_KEY."); return; }
+  const msg=await send(chatId,`${shortAddr(wallet.address)}\n\n${key}\n\nDeletes in 30 seconds.`);
+  if (msg?.message_id) setTimeout(()=>safeDelete(chatId,msg.message_id),30000);
+}
 
-  if (!wallet) {
-    await safeSend(chatId, "I couldn't find that wallet.");
-    return;
-  }
+async function switchWallet(chatId,walletId) {
+  const user=getUser(chatId); const wallet=(user.wallets||[]).find(w=>w.id===walletId);
+  if (!wallet) { await send(chatId,"Wallet not found."); return; }
+  user.activeWalletId=wallet.id; saveDb();
+  const bal=await quickBalance(wallet);
+  await send(chatId,`Active: ${shortAddr(wallet.address)}  ${bal}`,KEYBOARD);
+}
 
-  if (!wallet.encryptedPrivateKey) {
-    await safeSend(chatId, "This wallet cannot be exported.");
-    return;
-  }
+async function showReceive(chatId) {
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  if (!wallet) { await send(chatId,"Set a wallet first.",{reply_markup:{inline_keyboard:[[{text:"Create Wallet",callback_data:"wallet:create"}]]}}); return; }
+  await send(chatId,`Your address:\n\n${wallet.address}\n\nShare this to receive ETH, tokens, or NFTs on Ethereum and Base.`);
+}
 
-  let privateKey;
+// ─── SEND NFT / TOKEN ─────────────────────────────────────────────────────────
+async function startSendNft(chatId) {
+  const user=getUser(chatId);
+  if (!activeWallet(user)) { await send(chatId,"Set a wallet first."); return; }
+  user.state={mode:"send_nft_id",at:Date.now()}; saveDb();
+  await send(chatId,"Send NFT\n\nReply with the contract address and token ID:\n\nExample: 0xAbCd...1234 42");
+}
+async function handleSendNftId(chatId,text,state) {
+  const parts=text.trim().split(/\s+/); const contract=parts.find(p=>ethers.isAddress(p)); const tokenId=parts.find(p=>/^\d+$/.test(p));
+  if (!contract||!tokenId) { await send(chatId,"Need a contract address and token ID.\n\nExample: 0xAbCd...1234 42"); return; }
+  const user=getUser(chatId); user.state={mode:"send_nft_to",contract:ethers.getAddress(contract),tokenId,at:Date.now()}; saveDb();
+  await send(chatId,`Token #${tokenId} from ${shortAddr(contract)}.\n\nDestination address:`);
+}
+async function handleSendNftTo(chatId,text,state) {
+  const to=extractAddr(text); if (!to) { await send(chatId,"Invalid address. Try again."); return; }
+  const user=getUser(chatId); user.state={}; saveDb();
+  const wallet=activeWallet(user); if (!wallet) { await send(chatId,"No active wallet."); return; }
+  await send(chatId,`Sending token #${state.tokenId} to ${shortAddr(to)}...`);
   try {
-    privateKey = decryptPrivateKey(wallet.encryptedPrivateKey);
-  } catch (err) {
-    await safeSend(chatId, "Export failed. Try again from the wallet menu.");
-    return;
-  }
-
-  const msg = await safeSend(
-    chatId,
-    [
-      "Secret key",
-      `Address: ${wallet.address}`,
-      "",
-      privateKey,
-      "",
-      "This message disappears in 30 seconds."
-    ].join("\n")
-  );
-
-  if (msg && msg.message_id) {
-    setTimeout(() => safeDelete(chatId, msg.message_id), 30000);
-  }
+    const provider=getProvider(defaultChain().chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    const contract=new ethers.Contract(state.contract,ERC721_ABI,signer);
+    const tx=await contract.transferFrom(wallet.address,to,BigInt(state.tokenId));
+    await send(chatId,`Submitted. Tx: ${tx.hash}`);
+    const r=await tx.wait(1);
+    if (r?.status===1) await send(chatId,`Done. NFT #${state.tokenId} sent to ${shortAddr(to)}.\nTx: ${tx.hash}`);
+    else await send(chatId,`May have failed. Check: ${tx.hash}`);
+  } catch(err) { await send(chatId,`Transfer failed: ${shortErr(err)}`); }
 }
-
-async function switchWallet(chatId, walletId) {
-  const user = getUser(chatId);
-  const wallet = (user.wallets || []).find((item) => item.id === walletId);
-
-  if (!wallet) {
-    await safeSend(chatId, "I couldn't find that wallet.");
-    return;
-  }
-
-  user.activeWalletId = wallet.id;
-  saveDb();
-  await safeSend(chatId, `Done. You are now using ${shortAddress(wallet.address)}.`, MAIN_MENU_KEYBOARD);
-  armAllAutoMintTimers();
+async function startSendToken(chatId) {
+  const user=getUser(chatId); if (!activeWallet(user)) { await send(chatId,"Set a wallet first."); return; }
+  user.state={mode:"send_token_contract",at:Date.now()}; saveDb();
+  await send(chatId,"Send Token\n\nReply with the ERC-20 token contract address.\n\nExample: 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 }
-
-async function sendReceiveAddress(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Add a wallet first.", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Create New Wallet", callback_data: "wallet:create" }],
-          [{ text: "Import Wallet", callback_data: "wallet:import" }]
-        ]
-      }
-    });
-    return;
-  }
-
-  await safeSend(
-    chatId,
-    [
-      "Receive",
-      "Use this wallet address to receive ETH, coins, or NFTs.",
-      "",
-      wallet.address
-    ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Fund Wallet", callback_data: "fund:wallet" }],
-          [{ text: "Ready Check", callback_data: "ready:check" }]
-        ]
-      }
-    }
-  );
+async function handleSendTokenContract(chatId,text) {
+  const addr=extractAddr(text); if (!addr) { await send(chatId,"Invalid contract address. Try again."); return; }
+  const user=getUser(chatId); user.state={mode:"send_token_amount",tokenContract:addr,at:Date.now()}; saveDb();
+  await send(chatId,`Contract: ${shortAddr(addr)}\n\nHow much to send? (e.g. 100)`);
 }
-
-async function sendFundWallet(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Add a wallet first, then come back here to fund it.");
-    return;
-  }
-
-  const funding = await fundingSnapshot(user).catch(() => null);
-  const qrUrl = qrCodeUrl(wallet.address);
-  const lines = [
-    "Fund Wallet",
-    `Wallet: ${wallet.address}`,
-    funding && funding.network ? `For next mint on: ${funding.network}` : "",
-    funding && funding.targetEth ? `Target for next mint: ${funding.targetEth} ETH` : "Target for next mint: not available yet",
-    funding && funding.balanceEth ? `Current wallet balance: ${funding.balanceEth} ETH` : "",
-    funding && funding.shortfallEth ? `Still short: ${funding.shortfallEth} ETH` : funding && funding.targetEth ? "Still short: 0 ETH" : "",
-    "",
-    "Scan the QR or copy the wallet address above."
-  ].filter(Boolean).join("\n");
-
-  await safeSendPhoto(chatId, qrUrl, {
-    caption: lines,
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "Receive", callback_data: "receive" }],
-        [{ text: "Ready Check", callback_data: "ready:check" }]
-      ]
-    }
-  });
+async function handleSendTokenAmount(chatId,text,state) {
+  const amount=parseFloat(text.trim()); if (!Number.isFinite(amount)||amount<=0) { await send(chatId,"Invalid amount. Reply with a number like 100."); return; }
+  const user=getUser(chatId); user.state={mode:"send_token_to",tokenContract:state.tokenContract,amount,at:Date.now()}; saveDb();
+  await send(chatId,`Amount: ${amount}\n\nDestination address:`);
 }
-
-async function sendReadyCheck(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-  const nextMint = nextLiveMint(user);
-  const funding = await fundingSnapshot(user).catch(() => null);
-  const riskMode = riskModeForUser(user);
-
-  const lines = [
-    "Ready Check",
-    `Wallet loaded: ${wallet ? "yes" : "no"}`,
-    `Live mint tracked: ${nextMint ? "yes" : "no"}`,
-    `Gas cap set: ${nextMint && (nextMint.gasCapEth || nextMint.recommendedGasCapEth) ? "yes" : "no"}`,
-    `Mode: ${riskMode.label}`,
-    nextMint ? `Next mint: ${nextMint.mintName}` : "Next mint: not set",
-    nextMint ? `Next buy time: ${formatDateTime(nextMint.mintTime)}` : "",
-    funding && funding.targetEth ? `Enough ETH: ${Number(funding.shortfallEth || 0) > 0 ? "no" : "yes"}` : "Enough ETH: unknown",
-    funding && funding.targetEth ? `Target: ${funding.targetEth} ETH` : "",
-    funding && funding.balanceEth ? `Wallet balance: ${funding.balanceEth} ETH` : "",
-    funding && funding.shortfallEth && Number(funding.shortfallEth) > 0 ? `Still short: ${funding.shortfallEth} ETH` : ""
-  ].filter(Boolean).join("\n");
-
-  await safeSend(chatId, lines, {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "Fund Wallet", callback_data: "fund:wallet" },
-          { text: `Mode: ${riskMode.label}`, callback_data: "riskmode:panel" }
-        ],
-        nextMint ? [{ text: "Open Live Status", callback_data: "status:open" }] : []
-      ].filter((row) => row.length)
-    }
-  });
-}
-
-async function sendPnlDashboard(chatId) {
-  const user = getUser(chatId);
-  const pnl = await buildPnlDashboard(user);
-
-  await safeSend(
-    chatId,
-    [
-      "PnL",
-      `Total spent: ${pnl.totalSpentEth} ETH`,
-      `Total wins: ${pnl.totalWins}`,
-      `Total realized profit: ${pnl.totalRealizedProfitEth} ETH`,
-      `Unrealized profit: ${pnl.totalUnrealizedProfitEth} ETH`,
-      `Best hit: ${pnl.bestHit}`,
-      `Worst hit: ${pnl.worstHit}`
-    ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Winners", callback_data: "leaderboard" }],
-          [{ text: "Open Live Status", callback_data: "status:open" }]
-        ]
-      }
-    }
-  );
-}
-
-async function sendRiskModePanel(chatId) {
-  const user = getUser(chatId);
-  const active = riskModeForUser(user);
-  await safeSend(
-    chatId,
-    [
-      "Risk Mode",
-      `Current mode: ${active.label}`,
-      "",
-      "Safe keeps gas tighter.",
-      "Fast is the default balance.",
-      "Degenerate pushes harder when gas starts moving."
-    ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Safe", callback_data: "riskmode:set:safe" }],
-          [{ text: "Fast", callback_data: "riskmode:set:fast" }],
-          [{ text: "Degenerate", callback_data: "riskmode:set:degenerate" }]
-        ]
-      }
-    }
-  );
-}
-
-async function setRiskMode(chatId, mode) {
-  const user = getUser(chatId);
-  const riskMode = RISK_MODES[normalizeRiskMode(mode)] || RISK_MODES.fast;
-  user.riskMode = riskMode.key;
-  user.gasWarMode = riskMode.gasWarMode;
-
-  if (user.pendingMint) {
-    user.pendingMint.riskMode = riskMode.key;
-    user.pendingMint.gasWarMode = riskMode.gasWarMode;
-    user.pendingMint.flashbotsEnabled = riskMode.flashbotsEnabled;
-    user.pendingMint.updatedAt = Date.now();
-  }
-
-  for (const mint of user.mints || []) {
-    if (mint.completedAt) continue;
-    mint.riskMode = riskMode.key;
-    mint.gasWarMode = riskMode.gasWarMode;
-    mint.flashbotsEnabled = riskMode.flashbotsEnabled;
-    mint.updatedAt = Date.now();
-  }
-
-  saveDb();
-  await safeSend(
-    chatId,
-    [
-      `Mode set: ${riskMode.label}`,
-      riskMode.key === "safe"
-        ? "This keeps gas tighter and calmer."
-        : riskMode.key === "degenerate"
-          ? "This pushes harder when things get crowded."
-          : "This keeps you balanced between cost and speed."
-    ].join("\n")
-  );
-}
-
-async function startInstantMintFlow(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Add a wallet first. Instant Mint uses your live wallet.");
-    return;
-  }
-
-  user.state = { mode: "awaiting_instant_target" };
-  saveDb();
-  await safeSend(
-    chatId,
-    [
-      "Instant Mint",
-      "Paste a mint page or collection address.",
-      "The bot will try to buy right away from your live wallet and then show you what happened."
-    ].join("\n")
-  );
-}
-
-async function handleInstantMintInput(chatId, text) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    user.state = {};
-    saveDb();
-    await safeSend(chatId, "No active wallet yet. Add one first.");
-    return;
-  }
-
-  const draft = await draftFromMintInput(text, "public");
-  if (!draft.contractAddress) {
-    logUnhandled(chatId, "instant_mint_bad_target", text);
-    await safeSend(chatId, "I couldn't read that mint page. Paste the OpenSea link again.");
-    return;
-  }
-
-  user.state = {};
-  const verified = await verifyMintDetailsFromContract(draft).catch(() => draft);
-  const mint = buildMintRecord({ ...verified, mintTime: Date.now() - AUTO_MINT_DELAY_MS }, draft);
-  mint.confirmed = true;
-  mint.confirmedAt = Date.now();
-  mint.instant = true;
-  mint.autoMintEnabled = true;
-  mint.remindersEnabled = false;
-  mint.riskMode = riskModeForUser(user).key;
-  mint.gasWarMode = riskModeForUser(user).gasWarMode;
-  mint.flashbotsEnabled = riskModeForUser(user).flashbotsEnabled;
-  user.mints = user.mints || [];
-  user.mints.push(mint);
-  saveDb();
-
-  await safeSend(chatId, `Buying ${mint.mintName} now... stay ready.`);
-  await maybeAttemptAutoMint(chatId, mint.id, "instant");
-}
-
-async function startSendTokenFlow(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Add a wallet first. Send Token uses your live wallet.");
-    return;
-  }
-
-  user.state = { mode: "awaiting_send_token" };
-  saveDb();
-  await safeSend(
-    chatId,
-    [
-      "Send Token",
-      "Reply with the coin address, the amount, and the network if needed.",
-      "Example: 0xTokenAddress 25 base"
-    ].join("\n")
-  );
-}
-
-async function handleSendTokenDetails(chatId, text) {
-  const user = getUser(chatId);
-  const tokenAddress = extractAddress(text);
-  const amountMatch = text.match(/(?:^|\s)(\d+(?:\.\d+)?)(?:\s|$)/);
-  const chain = text.toLowerCase().includes("base") ? CHAIN_CONFIGS.base : getDefaultChainConfig();
-
-  if (!tokenAddress || !amountMatch) {
-    await safeSend(chatId, "Send the coin address and amount. Example: 0xTokenAddress 25 base");
-    return;
-  }
-
-  user.state = {
-    mode: "awaiting_send_token_destination",
-    tokenAddress,
-    amount: amountMatch[1],
-    chainId: chain.chainId
-  };
-  saveDb();
-  await safeSend(chatId, "Now send the wallet address you want this sent to.");
-}
-
-async function handleSendTokenDestination(chatId, text) {
-  const user = getUser(chatId);
-  const walletRecord = getActiveWallet(user);
-  const destination = extractAddress(text);
-  const state = user.state || {};
-
-  if (!destination) {
-    await safeSend(chatId, "Send a valid destination wallet address.");
-    return;
-  }
-
-  user.state = {};
-  saveDb();
-
+async function handleSendTokenTo(chatId,text,state) {
+  const to=extractAddr(text); if (!to) { await send(chatId,"Invalid address. Try again."); return; }
+  const user=getUser(chatId); user.state={}; saveDb();
+  const wallet=activeWallet(user); if (!wallet) { await send(chatId,"No active wallet."); return; }
+  await send(chatId,`Sending ${state.amount} tokens to ${shortAddr(to)}...`);
   try {
-    const result = await executeTokenTransfer(user, walletRecord, {
-      tokenAddress: state.tokenAddress,
-      amount: state.amount,
-      destination,
-      chainId: state.chainId
-    });
-    await sendTxResult(chatId, "Token transfer submitted.", result.hash, state.chainId);
-  } catch (err) {
-    await safeSend(chatId, userFriendlyError(err, "That send did not go through. Check your balance and try again."));
-  }
+    const provider=getProvider(defaultChain().chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    const contract=new ethers.Contract(state.tokenContract,ERC20_ABI,signer);
+    const decimals=await contract.decimals().catch(()=>18n);
+    const raw=ethers.parseUnits(String(state.amount),Number(decimals));
+    const tx=await contract.transfer(to,raw);
+    await send(chatId,`Submitted. Tx: ${tx.hash}`);
+    const r=await tx.wait(1);
+    if (r?.status===1) await send(chatId,`Done. ${state.amount} tokens sent to ${shortAddr(to)}.\nTx: ${tx.hash}`);
+    else await send(chatId,`May have failed. Check: ${tx.hash}`);
+  } catch(err) { await send(chatId,`Transfer failed: ${shortErr(err)}`); }
 }
 
-async function startSendNftFlow(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Add a wallet first. Send NFT uses your live wallet.");
-    return;
-  }
-
-  const nfts = await fetchWalletNfts(wallet.address, 12);
-  if (!nfts.length) {
-    await safeSend(chatId, "I couldn't find any NFTs in your live wallet right now.");
-    return;
-  }
-
-  user.nftSelections = {};
-  const buttons = nfts.map((nft) => {
-    const id = randomId(4);
-    user.nftSelections[id] = nft;
-    return [{
-      text: `${nft.name || nft.tokenId || "NFT"} (${nft.chainName})`.slice(0, 60),
-      callback_data: `sendnft:pick:${id}`
-    }];
-  });
-  saveDb();
-
-  await safeSend(
-    chatId,
-    "Send NFT\nPick the NFT you want to send. After that, send the wallet address you want it sent to.",
-    { reply_markup: { inline_keyboard: buttons } }
-  );
+// ─── TRACK ────────────────────────────────────────────────────────────────────
+async function startTrack(chatId) {
+  const user=getUser(chatId); user.state={mode:"track_input",at:Date.now()}; saveDb();
+  await send(chatId,"Drop the OpenSea mint URL.\n\nExample: https://opensea.io/collection/azuki");
 }
 
-async function pickNftToSend(chatId, nftId) {
-  const user = getUser(chatId);
-  const nft = user.nftSelections && user.nftSelections[nftId];
-
-  if (!nft) {
-    await safeSend(chatId, "That pick expired. Open Send NFT again.");
-    return;
+async function handleTrackInput(chatId,text) {
+  const user=getUser(chatId);
+  const draft={quantity:extractQty(text)||1,userTier:extractTier(text)};
+  const os=parseOsUrl(text); const direct=extractAddr(text);
+  if (!os.isOpenSea&&!direct) { logUnhandled(chatId,text); await send(chatId,"That doesn't look like an OpenSea URL.\n\nDrop the mint URL directly."); return; }
+  if (os.slug) {
+    try { const col=await fetchOsCollection(os.slug,os.chainId); Object.assign(draft,{mintName:col.name||os.slug,contractAddress:col.contractAddress,chainId:col.chainId,chainName:col.chainName,openSeaSlug:os.slug,metadata:col}); }
+    catch { draft.mintName=os.slug; draft.openSeaSlug=os.slug; }
   }
-
-  user.state = { mode: "awaiting_send_nft_destination", nft };
-  saveDb();
-  await safeSend(chatId, `Picked ${nft.name || nft.tokenId}. Now send the wallet address you want it sent to.`);
+  if (os.contractAddress||direct) { draft.contractAddress=os.contractAddress||direct; draft.chainId=os.chainId||draft.chainId||defaultChain().chainId; }
+  if (!draft.contractAddress) { user.state={mode:"track_input",at:Date.now()}; saveDb(); await send(chatId,"Couldn't find a contract address in that URL. Try again."); return; }
+  if (draft.userTier) { await verifyAndBuildMint(chatId,draft); return; }
+  user.state={mode:"awaiting_stage",draft,at:Date.now()}; saveDb();
+  await send(chatId,"Which phase are you eligible for?",{reply_markup:{inline_keyboard:[
+    [{text:"GTD",callback_data:"stage:gtd"},{text:"OG",callback_data:"stage:og"}],
+    [{text:"WL",callback_data:"stage:wl"},{text:"Public",callback_data:"stage:public"}]
+  ]}});
 }
 
-async function handleSendNftDestination(chatId, text) {
-  const user = getUser(chatId);
-  const walletRecord = getActiveWallet(user);
-  const destination = extractAddress(text);
-  const nft = user.state && user.state.nft;
-
-  if (!destination) {
-    await safeSend(chatId, "Send a valid destination wallet address.");
-    return;
-  }
-
-  user.state = {};
-  saveDb();
-
+async function verifyAndBuildMint(chatId,draft) {
+  const user=getUser(chatId);
   try {
-    const result = await executeNftTransfer(user, walletRecord, nft, destination);
-    await sendTxResult(chatId, "NFT transfer submitted.", result.hash, nft.chainId);
-  } catch (err) {
-    await safeSend(chatId, userFriendlyError(err, "That send did not go through. Check the item and try again."));
+    const verified=await verifyFromContract(draft);
+    const mint=buildMintRecord(verified,draft);
+    if (!mint.mintTime) { user.state={mode:"track_input",at:Date.now()}; saveDb(); await send(chatId,"Couldn't find the phase open time from the contract. Drop the URL again."); return; }
+    mint._estCap=await estGasCap(mint).catch(()=>null);
+    user.pendingMint=mint; user.state={}; saveDb();
+    await send(chatId,mintCard(chatId,mint),{reply_markup:mintKeyboard(mint)});
+  } catch(err) {
+    user.state={mode:"track_input",at:Date.now()}; saveDb();
+    await send(chatId,`Couldn't process that drop: ${shortErr(err)}\n\nTry again or paste the contract address directly.`);
   }
 }
 
-async function startTrackFlow(chatId) {
-  const user = getUser(chatId);
-  user.state = { mode: "awaiting_track_input" };
-  saveDb();
-
-  await safeSend(
-    chatId,
-    [
-      "Track Mint",
-      "Paste the OpenSea mint page.",
-      "",
-      "Example:",
-      "https://opensea.io/collection/example"
-    ].join("\n")
-  );
-}
-
-async function handleTrackInput(chatId, text) {
-  const user = getUser(chatId);
-  const draft = await draftFromMintInput(text, extractTier(text));
-
-  const openSea = parseOpenSeaInput(text);
-  const directAddress = extractAddress(text);
-
-  if (openSea.isOpenSea || openSea.slug || openSea.contractAddress || directAddress) {
-    if (openSea.isOpenSea) {
-      draft.sourceUrl = text;
-      draft.openSeaPath = openSea.path || null;
-      draft.chainId = openSea.chainId || null;
-    }
-
-    if (openSea.slug) {
-      draft.sourceUrl = text;
-      draft.openSeaSlug = openSea.slug;
-
-      try {
-        const collection = await fetchOpenSeaCollection(openSea.slug, draft.chainId);
-        draft.mintName = collection.name || openSea.slug;
-        draft.contractAddress = collection.contractAddress || null;
-        draft.chainId = collection.chainId || draft.chainId;
-        draft.chainName = collection.chainName || null;
-        draft.metadata = collection;
-      } catch (err) {
-        draft.mintName = openSea.slug;
-        draft.metadataError = shortError(err);
-      }
-    }
-
-    if (openSea.contractAddress || directAddress) {
-      draft.contractAddress = openSea.contractAddress || directAddress;
-      draft.sourceUrl = openSea.contractAddress ? text : draft.sourceUrl || null;
-      draft.chainId = openSea.chainId || draft.chainId || getDefaultChainConfig().chainId;
-    }
-
-    if (!draft.contractAddress) {
-      user.state = { mode: "awaiting_track_input" };
-      saveDb();
-      await safeSend(chatId, "I couldn't read that mint page. Paste the OpenSea link again.");
-      return;
-    }
-
-    if (draft.userTier) {
-      await verifyAndCreatePendingMint(chatId, draft);
-      return;
-    }
-
-    user.state = { mode: "awaiting_stage", draft };
-    saveDb();
-    await safeSend(chatId, "Which access do you have for this drop?", {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "GTD", callback_data: "stage:gtd" },
-            { text: "OG", callback_data: "stage:og" }
-          ],
-          [
-            { text: "WL", callback_data: "stage:wl" },
-            { text: "Public", callback_data: "stage:public" }
-          ]
-        ]
-      }
-    });
-    return;
-  }
-
-  await safeSend(chatId, "I couldn't read that mint page. Paste the OpenSea link again.");
-}
-
-async function draftFromMintInput(text, tier = null) {
-  const draft = {
-    quantity: extractQuantity(text) || 1,
-    userTier: tier || extractTier(text),
-    chainId: null
-  };
-
-  const openSea = parseOpenSeaInput(text);
-  const directAddress = extractAddress(text);
-
-  if (openSea.isOpenSea) {
-    draft.sourceUrl = text;
-    draft.openSeaPath = openSea.path || null;
-    draft.chainId = openSea.chainId || null;
-  }
-
-  if (openSea.slug) {
-    draft.sourceUrl = text;
-    draft.openSeaSlug = openSea.slug;
-
-    try {
-      const collection = await fetchOpenSeaCollection(openSea.slug, draft.chainId);
-      draft.mintName = collection.name || openSea.slug;
-      draft.contractAddress = collection.contractAddress || null;
-      draft.chainId = collection.chainId || draft.chainId;
-      draft.chainName = collection.chainName || null;
-      draft.metadata = collection;
-    } catch (err) {
-      draft.mintName = openSea.slug;
-      draft.metadataError = shortError(err);
-    }
-  }
-
-  if (openSea.contractAddress || directAddress) {
-    draft.contractAddress = openSea.contractAddress || directAddress;
-    draft.sourceUrl = openSea.contractAddress ? text : draft.sourceUrl || null;
-    draft.chainId = openSea.chainId || draft.chainId || getDefaultChainConfig().chainId;
-  }
-
-  if (!draft.mintName) {
-    draft.mintName = draft.openSeaSlug || (draft.contractAddress ? shortAddress(draft.contractAddress) : "NFT Mint");
-  }
-
-  return draft;
-}
-
-async function verifyAndCreatePendingMint(chatId, draft) {
-  const user = getUser(chatId);
-  await safeSend(chatId, "Checking the mint details now...");
-
-  let verified;
-  try {
-    verified = await verifyMintDetailsFromContract(draft);
-  } catch (err) {
-    user.state = { mode: "awaiting_track_input" };
-    saveDb();
-    await safeSend(chatId, userFriendlyError(err, "I couldn't lock this one in. Try another page or use Instant Mint."));
-    return;
-  }
-
-  const mint = buildMintRecord(verified, draft);
-  const riskMode = riskModeForUser(user);
-  mint.riskMode = riskMode.key;
-  mint.gasWarMode = riskMode.gasWarMode;
-  mint.flashbotsEnabled = riskMode.flashbotsEnabled;
-  if (!mint.mintTime) {
-    user.state = { mode: "awaiting_track_input" };
-    saveDb();
-    await safeSend(chatId, "I couldn't find your mint time from that page. Paste the OpenSea link again.");
-    return;
-  }
-
-  user.pendingMint = mint;
-  user.state = {};
-  saveDb();
-
-  await safeSend(chatId, formatMintCard(chatId, mint), {
-    reply_markup: mintConfirmKeyboard(mint)
-  });
-}
-
-async function verifyMintDetailsFromContract(draft) {
-  if (!draft.contractAddress || !ethers.isAddress(draft.contractAddress)) {
-    throw new Error("Contract address is missing");
-  }
-
-  const chainId = await resolveMintChainId(draft.contractAddress, draft.chainId);
-  const chain = getChainConfig(chainId);
-  const provider = getProvider(chain.chainId);
-  const abi = await resolveContractAbi({
-    contractAddress: draft.contractAddress,
-    chainId: chain.chainId
-  });
-  const readAbi = mergeAbi(abi, READ_ONLY_ABI);
-  const contract = new ethers.Contract(draft.contractAddress, readAbi, provider);
-  const phaseTimes = await readPhaseTimes(contract);
-  const priceEth = await readMintPrice(contract, draft.userTier);
-  const mintFunction = detectMintFunctionName(new ethers.Interface(abi), draft.userTier);
-  const userTier = normalizeTier(draft.userTier) || "public";
-  const phaseKey = `${userTier}Time`;
-
-  return {
-    ...draft,
-    ...phaseTimes,
-    chainId: chain.chainId,
-    chainName: chain.chainName,
-    userTier,
-    mintTime: phaseTimes[phaseKey] || null,
-    priceEth: priceEth || draft.priceEth || null,
-    mintFunction: mintFunction || draft.mintFunction || null
-  };
-}
-
-async function readPhaseTimes(contract) {
-  const result = {};
-
-  for (const [tier, names] of Object.entries(PHASE_TIME_READS)) {
-    for (const name of names) {
-      const timestamp = await tryReadTimestamp(contract, name);
-      if (timestamp) {
-        result[`${tier}Time`] = timestamp;
-        break;
-      }
-    }
-  }
-
-  return result;
-}
-
-async function resolveMintChainId(contractAddress, preferredChainId) {
-  const preferred = getChainConfig(preferredChainId);
-
-  if (preferred && providersByChainId.has(preferred.chainId)) {
-    const code = await providersByChainId.get(preferred.chainId).getCode(contractAddress).catch(() => "0x");
-    if (code && code !== "0x") return preferred.chainId;
-  }
-
-  for (const chain of configuredChains()) {
-    if (preferred && chain.chainId === preferred.chainId) continue;
-    const code = await providersByChainId.get(chain.chainId).getCode(contractAddress).catch(() => "0x");
-    if (code && code !== "0x") return chain.chainId;
-  }
-
-  if (preferred) return preferred.chainId;
-  return getDefaultChainConfig().chainId;
-}
-
-async function readMintPrice(contract, tier) {
-  const names = [
-    ...(PHASE_PRICE_READS[normalizeTier(tier)] || []),
-    ...PRICE_READS
-  ];
-
-  for (const name of [...new Set(names)]) {
-    const value = await tryReadUint(contract, name);
-    if (value != null) {
-      return ethers.formatEther(value);
-    }
-  }
-
-  return null;
-}
-
-async function tryReadTimestamp(contract, name) {
-  const value = await tryReadUint(contract, name);
-  if (value == null) return null;
-
-  const timestamp = Number(value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
-  return timestamp > 100000000000 ? timestamp : timestamp * 1000;
-}
-
-async function tryReadUint(contract, name) {
-  try {
-    if (typeof contract[name] !== "function") return null;
-    const value = await contract[name]();
-    if (typeof value === "bigint") return value;
-    if (value && typeof value.toString === "function") return BigInt(value.toString());
-    return BigInt(value);
-  } catch (err) {
-    return null;
-  }
-}
-
-function detectMintFunctionName(iface, tier) {
-  const fragments = iface.fragments
-    .filter((fragment) => fragment.type === "function")
-    .filter((fragment) => ["payable", "nonpayable"].includes(fragment.stateMutability));
-  const tierName = normalizeTier(tier);
-  const tierHints = {
-    gtd: ["gtd", "guaranteed"],
-    og: ["og", "presale", "private"],
-    wl: ["wl", "white", "allow", "pre"],
-    public: ["public", "mint"]
-  }[tierName] || [];
-
-  const tierMatch = fragments.find((fragment) => {
-    const lower = fragment.name.toLowerCase();
-    return tierHints.some((hint) => lower.includes(hint)) && MINT_FUNCTION_PRIORITY.includes(fragment.name);
-  });
-
-  if (tierMatch) return tierMatch.name;
-
-  const fallback = fragments.find((fragment) => MINT_FUNCTION_PRIORITY.includes(fragment.name));
-  return fallback ? fallback.name : null;
-}
-
-function mergeAbi(primaryAbi, extraAbi) {
-  const values = [];
-  const seen = new Set();
-
-  for (const item of [...primaryAbi, ...extraAbi]) {
-    const key = typeof item === "string" ? item : JSON.stringify(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    values.push(item);
-  }
-
-  return values;
-}
-
-function rpcUrlsFor(prefix, legacyUrl = null) {
-  const urls = [
-    process.env[`${prefix}_RPC_URL_1`],
-    process.env[`${prefix}_RPC_URL_2`],
-    process.env[`${prefix}_RPC_URL_3`],
-    process.env[`${prefix}_RPC_URL`],
-    legacyUrl,
-    prefix === "ETHEREUM" && LEGACY_CHAIN_ID === 1 ? process.env.RPC_URL_1 : null,
-    prefix === "ETHEREUM" && LEGACY_CHAIN_ID === 1 ? process.env.RPC_URL_2 : null,
-    prefix === "ETHEREUM" && LEGACY_CHAIN_ID === 1 ? process.env.RPC_URL_3 : null,
-    prefix === "BASE" && LEGACY_CHAIN_ID === 8453 ? process.env.RPC_URL_1 : null,
-    prefix === "BASE" && LEGACY_CHAIN_ID === 8453 ? process.env.RPC_URL_2 : null,
-    prefix === "BASE" && LEGACY_CHAIN_ID === 8453 ? process.env.RPC_URL_3 : null
-  ].filter(Boolean);
-
-  return [...new Set(urls)];
-}
-
-function makeProvider(chain) {
-  const providers = chain.rpcUrls.map((url) => new ethers.JsonRpcProvider(url, chain.chainId));
-
-  if (providers.length === 1) {
-    return providers[0];
-  }
-
-  return new ethers.FallbackProvider(
-    providers.map((provider, index) => ({
-      provider,
-      priority: index + 1,
-      weight: 1,
-      stallTimeout: 1000
-    })),
-    1
-  );
-}
-
-function getChainConfig(chainIdOrKey) {
-  if (!chainIdOrKey) {
-    return CHAIN_CONFIGS.ethereum;
-  }
-
-  const normalized = String(chainIdOrKey).toLowerCase();
-  return Object.values(CHAIN_CONFIGS).find((chain) => (
-    String(chain.chainId) === normalized
-      || chain.key === normalized
-      || chain.openSeaChain === normalized
-      || chain.chainName.toLowerCase() === normalized
-  )) || null;
-}
-
-function getDefaultChainConfig() {
-  return getChainConfig(LEGACY_CHAIN_ID) || CHAIN_CONFIGS.ethereum;
-}
-
-function getProvider(chainIdOrKey) {
-  const chain = getChainConfig(chainIdOrKey) || getDefaultChainConfig();
-  const provider = providersByChainId.get(chain.chainId);
-
-  if (!provider) {
-    throw new Error(`${chain.chainName} RPC is not configured`);
-  }
-
-  return provider;
-}
-
-function configuredChains() {
-  return Object.values(CHAIN_CONFIGS).filter((chain) => providersByChainId.has(chain.chainId));
-}
-
-function buildMintRecord(parsed, draft) {
-  const merged = { ...(draft || {}), ...(parsed || {}) };
-  const userTier = normalizeTier(merged.userTier) || "public";
-  const phaseKey = `${userTier}Time`;
-  const phaseTime = normalizeTimestamp(merged[phaseKey]);
-  const mintTime = normalizeTimestamp(merged.mintTime) || phaseTime || firstKnownPhaseTime(merged);
-  const chain = getChainConfig(merged.chainId || merged.chainName) || getDefaultChainConfig();
-
-  const mint = {
-    id: randomId(10),
-    mintName: merged.mintName || merged.openSeaSlug || "NFT Mint",
-    userTier,
-    gtdTime: normalizeTimestamp(merged.gtdTime),
-    ogTime: normalizeTimestamp(merged.ogTime),
-    wlTime: normalizeTimestamp(merged.wlTime),
-    publicTime: normalizeTimestamp(merged.publicTime),
-    mintTime,
-    contractAddress: merged.contractAddress && ethers.isAddress(merged.contractAddress)
-      ? ethers.getAddress(merged.contractAddress)
-      : null,
-    chainId: chain.chainId,
-    chainName: chain.chainName,
-    priceEth: merged.priceEth != null ? String(merged.priceEth) : null,
-    totalValueEth: merged.totalValueEth != null ? String(merged.totalValueEth) : null,
-    quantity: Math.max(1, Number(merged.quantity || 1)),
-    mintFunction: merged.mintFunction || null,
-    mintArgs: Array.isArray(merged.mintArgs) ? merged.mintArgs : null,
-    sourceUrl: merged.sourceUrl || null,
-    openSeaSlug: merged.openSeaSlug || null,
-    metadata: merged.metadata || null,
-    riskMode: normalizeRiskMode(merged.riskMode),
-    confirmed: false,
-    remindersEnabled: merged.remindersEnabled !== false,
-    autoMintEnabled: merged.autoMintEnabled !== false,
-    flashbotsEnabled: Boolean(merged.flashbotsEnabled),
-    gasWarMode: Boolean(merged.gasWarMode),
-    gasCapEth: merged.gasCapEth || null,
-    recommendedGasCapEth: merged.recommendedGasCapEth || null,
-    targetListPriceEth: merged.targetListPriceEth || null,
-    profitAlertMultiple: merged.profitAlertMultiple || null,
-    firedReminders: [],
-    openAlertSent: false,
-    autoMint: {
-      scheduled: false,
-      attempts: 0,
-      success: false,
-      inFlight: false,
-      txHash: null,
-      lastError: null,
-      lastAttemptAt: null
-    },
-    createdAt: Date.now(),
-    updatedAt: Date.now()
-  };
-
-  if (!mint[phaseKey] && mint.mintTime) {
-    mint[phaseKey] = mint.mintTime;
-  }
-
-  return mint;
-}
-
-function mintConfirmKeyboard(mint) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "Lock It In", callback_data: `confirm:${mint.id}` },
-        { text: "Cancel", callback_data: `cancel:${mint.id}` }
-      ],
-      [
-        {
-          text: `Reminders ${mint.remindersEnabled ? "On" : "Off"}`,
-          callback_data: `toggle:reminders:${mint.id}`
-        },
-        {
-          text: `Auto-Buy ${mint.autoMintEnabled ? "On" : "Off"}`,
-          callback_data: `toggle:auto:${mint.id}`
-        }
-      ],
-      [
-        {
-          text: `Private Send ${mint.flashbotsEnabled ? "On" : "Off"}`,
-          callback_data: `toggle:flashbots:${mint.id}`
-        },
-        {
-          text: `Gas War ${mint.gasWarMode ? "On" : "Off"}`,
-          callback_data: `toggle:gaswar:${mint.id}`
-        }
-      ],
-      [
-        { text: "Sell Target", callback_data: `target_list:${mint.id}` }
-      ],
-      [
-        { text: "Profit Ping", callback_data: `profit_threshold:${mint.id}` }
-      ]
-    ]
-  };
-}
-
-function formatMintCard(chatId, mint) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-  const pendingFeeEth = pendingFeeForChain(user, mint.chainId);
-  const riskMode = riskModeForMint(user, mint);
-  const autoMode = mint.autoMintEnabled
-    ? `Auto-buy fires ${AUTO_MINT_DELAY_MS / 1000}s after your window opens and keeps trying every ${POLL_INTERVAL_MS / 1000}s during the retry window.`
-    : "Auto-buy is off. The bot will only remind you and ping when the window opens.";
-
+// ─── MINT CARD ────────────────────────────────────────────────────────────────
+function mintCard(chatId,mint) {
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  const pending=user.pendingFee||{};
+  const pendingTotal=Object.values(pending).reduce((s,f)=>s+parseFloat(f.feeEth||0),0);
   return [
     `${mint.mintName}`,
+    `${mint.userTier.toUpperCase()} — ${formatDt(mint.mintTime)}  (${formatDur(mint.mintTime-Date.now())})`,
     "",
-    `Your lane: ${mint.userTier.toUpperCase()}`,
-    `Your time: ${formatDateTime(mint.mintTime)}`,
-    `Countdown: ${formatDuration(mint.mintTime - Date.now())}`,
+    "Phase times:",
+    mint.gtdTime    ?`GTD     ${formatDt(mint.gtdTime)}`:null,
+    mint.ogTime     ?`OG      ${formatDt(mint.ogTime)}`:null,
+    mint.wlTime     ?`WL      ${formatDt(mint.wlTime)}`:null,
+    mint.publicTime ?`Public  ${formatDt(mint.publicTime)}`:null,
     "",
-    "Full drop schedule:",
-    `GTD: ${formatOptionalTime(mint.gtdTime)}`,
-    `OG: ${formatOptionalTime(mint.ogTime)}`,
-    `WL: ${formatOptionalTime(mint.wlTime)}`,
-    `Public: ${formatOptionalTime(mint.publicTime)}`,
+    `Chain     ${mint.chainName}`,
+    `Contract  ${mint.contractAddress||"—"}`,
+    `Price     ${mint.priceEth||"—"} ETH`,
+    `Qty       ${mint.quantity}`,
+    `Wallet    ${wallet?shortAddr(wallet.address):"none — set a wallet first"}`,
     "",
-    "Your setup:",
-    `Network: ${mint.chainName}`,
-    `Mint page: ${mint.contractAddress ? "ready" : "not ready"}`,
-    `Buy price: ${mint.priceEth || mint.totalValueEth || "not set"} ETH`,
-    `Quantity: ${mint.quantity}`,
-    `Wallet: ${wallet ? shortAddress(wallet.address) : "not set"}`,
-    `Mode: ${riskMode.label}`,
-    `Max gas spend: ${mint.gasCapEth || mint.recommendedGasCapEth || "set after lock-in"} ETH`,
-    `Gas War: ${mint.gasWarMode ? "on" : "off"}`,
-    `Private send: ${mint.flashbotsEnabled ? "on" : "off"}`,
-    pendingProfitAgreementLine(user, mint.chainId),
+    `Gas cap   ${mint._userGasCap?mint._userGasCap+" ETH":mint._estCap?mint._estCap+" ETH (est)":"not set"}`,
+    `Gas War   ${mint.gasWarMode?"ON — escalates each retry":"off — 10% baseline"}`,
+    `Flashbots ${mint.flashbotsEnabled?"ON — private mempool":"off"}`,
+    `Auto-mint ${mint.autoMintEnabled?"ON":"off"}`,
+    `Reminders ${mint.remindersEnabled?"on":"off"}`,
+    mint.targetListPrice?`Target    ${mint.targetListPrice} ETH`:null,
     "",
-    "What happens next:",
-    autoMode,
-    "",
-    "Platform fee: 5% of profit only if this NFT sells above mint price. No fee is taken on a loss or break-even sale.",
-    "",
-    `Reminders: ${mint.remindersEnabled ? "on" : "off"}`,
-    `Auto-buy: ${mint.autoMintEnabled ? "on" : "off"}`,
-    "",
-    "Lock this in only if it all looks right."
-  ].filter((line) => line !== "").join("\n");
+    pendingTotal>0?`⚠️  Pending fee: ${pendingTotal.toFixed(6)} ETH bundled into this mint.`:null,
+    "Fee: 5% of profit only. Zero on losses.",
+  ].filter(l=>l!==null&&l!==undefined).join("\n");
 }
 
-async function confirmMint(chatId, mintId) {
-  const user = getUser(chatId);
-  const mint = user.pendingMint;
-
-  if (!mint || mint.id !== mintId) {
-    await safeSend(chatId, "That setup is gone. Start again with a fresh mint page.");
-    return;
-  }
-
-  mint.confirmed = true;
-  mint.confirmedAt = Date.now();
-  mint.updatedAt = Date.now();
-  user.mints = user.mints || [];
-  user.mints.push(mint);
-  user.pendingMint = null;
-  user.state = {};
-  saveDb();
-
-  await safeSend(
-    chatId,
-    [
-      `${mint.mintName} locked in.`,
-      `Your ${mint.userTier.toUpperCase()} lane opens at ${formatDateTime(mint.mintTime)}.`,
-      "",
-      mint.autoMintEnabled
-        ? "Auto-buy is on. You are set."
-        : "Auto-buy is off. You will still get reminders if they are on.",
-      "",
-      `Reminders: ${REMINDERS.map((item) => item.label).join(", ")}`
-    ].join("\n"),
-    MAIN_MENU_KEYBOARD
-  );
-
-  scheduleAutoMint(chatId, mint);
+function mintKeyboard(mint) {
+  return {inline_keyboard:[
+    [{text:"✅ Confirm",callback_data:`confirm:${mint.id}`},{text:"❌ Cancel",callback_data:`cancel_pending:${mint.id}`}],
+    [{text:`🔔 Reminders ${mint.remindersEnabled?"✓":""}`,callback_data:`toggle:reminders:${mint.id}`},{text:`🤖 Auto-mint ${mint.autoMintEnabled?"✓":""}`,callback_data:`toggle:auto:${mint.id}`}],
+    [{text:`⚔️ Gas War ${mint.gasWarMode?"ON":"off"}`,callback_data:`toggle:gaswar:${mint.id}`},{text:`🔒 Flashbots ${mint.flashbotsEnabled?"ON":"off"}`,callback_data:`toggle:flashbots:${mint.id}`}],
+    [{text:"⛽ Set Gas Cap",callback_data:`set_gas_cap:${mint.id}`},{text:"🎯 Target List Price",callback_data:`set_target_list:${mint.id}`}],
+    [{text:"🔔 Profit Alert Level",callback_data:`set_profit_alert:${mint.id}`}]
+  ]};
 }
 
-async function askGasCapApproval(chatId, mintId) {
-  const user = getUser(chatId);
-  const mint = user.pendingMint;
+// ─── CONFIRM ─────────────────────────────────────────────────────────────────
+async function confirmMint(chatId,mintId) {
+  const user=getUser(chatId); const mint=user.pendingMint;
+  if (!mint||mint.id!==mintId) { await send(chatId,"This mint setup expired. Start a new one."); return; }
+  // Auto-accept the gas estimate — user can override via "Set Gas Cap" button if they want
+  if (!mint._userGasCap&&mint._estCap) mint._userGasCap=mint._estCap;
+  await finalizeConfirm(chatId,mint);
+}
 
-  if (!mint || mint.id !== mintId) {
-    await safeSend(chatId, "That setup is gone. Start again with a fresh mint page.");
-    return;
+async function handleGasCap(chatId,text,state) {
+  const user=getUser(chatId);
+  const target=state.ctx==="confirm"?user.pendingMint:(user.mints||[]).find(m=>m.id===state.mintId);
+  if (!target) { user.state={}; saveDb(); await send(chatId,"Mint not found. Start a new one."); return; }
+  if (text.trim().toLowerCase()==="ok") { target._userGasCap=target._estCap; }
+  else { const v=parseFloat(text.trim()); if (!Number.isFinite(v)||v<=0) { await send(chatId,'Invalid. Reply with a number like 0.005, or "ok" to accept.'); return; } target._userGasCap=String(v); }
+  user.state={}; saveDb();
+  if (state.ctx==="confirm") await finalizeConfirm(chatId,target);
+  else await send(chatId,`Gas cap updated to ${target._userGasCap} ETH.`);
+}
+
+async function finalizeConfirm(chatId,mint) {
+  const user=getUser(chatId);
+  mint.confirmed=true; mint.confirmedAt=Date.now(); mint.updatedAt=Date.now();
+  user.mints=user.mints||[]; user.mints.push(mint);
+  user.pendingMint=null; user.state={};
+  lbAdd(chatId,"totalMints",0); saveDb();
+  await send(chatId,[
+    `Locked in: ${mint.mintName}`,
+    "",
+    `${mint.userTier.toUpperCase()} opens: ${formatDt(mint.mintTime)}`,
+    `That's ${formatDur(mint.mintTime-Date.now())} from now.`,
+    "",
+    mint.autoMintEnabled?`Auto-mint ON — fires ${AUTO_MINT_DELAY_MS/1000}s after open.`:"Auto-mint OFF — you'll get the open alert.",
+    "",
+    `Reminders: ${mint.remindersEnabled?REMINDERS.map(r=>r.label).join(" · "):"off"}`
+  ].join("\n"),KEYBOARD);
+  scheduleMint(chatId,mint);
+  startMempoolWatcher(chatId,mint);
+}
+
+async function handleTargetList(chatId,text,state) {
+  const v=parseFloat(text.trim()); if (!Number.isFinite(v)||v<=0) { await send(chatId,"Invalid. Reply with a number like 0.5."); return; }
+  const user=getUser(chatId); const mint=user.pendingMint||(user.mints||[]).find(m=>m.id===state.mintId);
+  if (!mint) { user.state={}; saveDb(); await send(chatId,"Mint not found."); return; }
+  mint.targetListPrice=String(v); user.state={}; saveDb();
+  await send(chatId,`Target set: ${v} ETH. Alert fires when the floor hits it.`);
+}
+
+async function handleProfitAlert(chatId,text,state) {
+  const v=parseInt(text.trim(),10); if (!Number.isFinite(v)||v<2) { await send(chatId,"Enter 2 or higher. Example: 3 = start alerts at 3x."); return; }
+  const user=getUser(chatId); const mint=user.pendingMint||(user.mints||[]).find(m=>m.id===state.mintId);
+  if (!mint) { user.state={}; saveDb(); await send(chatId,"Mint not found."); return; }
+  mint.profitAlertStart=v; user.state={}; saveDb();
+  await send(chatId,`First profit alert at ${v}x. Every new multiple after that too.`);
+}
+
+async function handleListPrice(chatId,text,state) {
+  const price=parseFloat(text.trim()); if (!Number.isFinite(price)||price<=0) { await send(chatId,"Invalid. Reply with a number like 0.3."); return; }
+  const user=getUser(chatId); const mint=(user.mints||[]).find(m=>m.id===state.mintId);
+  user.state={}; saveDb(); if (!mint) { await send(chatId,"Mint not found."); return; }
+  await doListing(chatId,mint,price);
+}
+
+// ─── INSTANT MINT ─────────────────────────────────────────────────────────────
+async function promptInstantMint(chatId) {
+  const user=getUser(chatId);
+  if (!activeWallet(user)) { await send(chatId,"No wallet set.",{reply_markup:{inline_keyboard:[[{text:"Create Wallet",callback_data:"wallet:create"}]]}}); return; }
+  user.state={mode:"instant_url",at:Date.now()}; saveDb();
+  await send(chatId,"⚡ Instant Mint\n\nPaste the contract address or OpenSea URL.\nNo confirmation. No delays. Fires immediately.");
+}
+
+async function doInstantMintFromUrl(chatId,text) {
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  if (!wallet) { await send(chatId,"No active wallet."); return; }
+  user.state={}; saveDb();
+  const os=parseOsUrl(text); let contract=os.contractAddress||extractAddr(text); let chainId=os.chainId||defaultChain().chainId;
+  if (!contract&&os.slug) {
+    try { const col=await fetchOsCollection(os.slug); contract=col.contractAddress; chainId=col.chainId||chainId; }
+    catch { await send(chatId,"Couldn't resolve the contract."); return; }
   }
+  if (!contract) { await send(chatId,"No contract address found."); return; }
+  await send(chatId,`Firing on ${shortAddr(contract)}...`);
+  try {
+    const provider=getProvider(chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    const abi=await resolveAbi({contractAddress:contract,chainId}); const iface=new ethers.Interface(abi);
+    const c=new ethers.Contract(contract,abi,signer);
+    const cand=pickMintFn(iface,{quantity:1,mintFunction:null,mintArgs:null,merkleProof:null},signer.address);
+    if (!cand) { await send(chatId,"Couldn't find a mint function on that contract."); return; }
+    const feeData=await provider.getFeeData(); const gas=buildGas(feeData,false,0);
+    const tx=await c[cand.functionKey](...cand.args,{...gas,value:0n});
+    const r=await tx.wait(1);
+    if (r?.status===1) await send(chatId,`✅ Minted.\nTx: ${tx.hash}`);
+    else await send(chatId,`May have failed. Check: ${tx.hash}`);
+  } catch(err) { await send(chatId,`Instant mint failed: ${shortErr(err)}`); }
+}
 
-  const estimate = await estimateGasCap(chatId, user, mint).catch((err) => ({
-    gasCapEth: ethers.formatEther(DEFAULT_GAS_LIMIT * ethers.parseUnits("30", "gwei")),
-    gasPercent: "unknown",
-    note: "Using a safe default because live estimation is unavailable."
-  }));
+async function doInstantMint(chatId,mint) {
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  if (!wallet) { await send(chatId,"No active wallet."); return; }
+  await send(chatId,`Firing on ${mint.mintName}...`);
+  try { const result=await runAutoMint(chatId,user,mint,wallet); await send(chatId,`Confirmed.\nTx: ${result.hash}`); }
+  catch(err) { await send(chatId,`Failed: ${shortErr(err)}`); }
+}
 
-  mint.recommendedGasCapEth = estimate.gasCapEth;
-  mint.gasCapEth = mint.gasCapEth || estimate.gasCapEth;
-  mint.gasEstimateNote = estimate.note || null;
-  user.state = { mode: "awaiting_gas_cap_custom", mintId };
-  saveDb();
+// ─── BLAST ────────────────────────────────────────────────────────────────────
+async function sendBlastMenu(chatId) {
+  const user=getUser(chatId); const wallets=user.wallets||[];
+  if (wallets.length<2) {
+    await send(chatId,"💣 Blast fires the same mint from every wallet simultaneously.\n\nYou only have one wallet. Add more, then blast.",
+      {reply_markup:{inline_keyboard:[[{text:"Add Wallet",callback_data:"wallet:import"}]]}}); return;
+  }
+  const active=(user.mints||[]).filter(m=>m.confirmed&&!m.completedAt);
+  if (!active.length) { user.state={mode:"blast_url",at:Date.now()}; saveDb(); await send(chatId,`💣 Blast — ${wallets.length} wallets ready.\n\nPaste the contract address or OpenSea URL.`); return; }
+  const buttons=active.map(m=>[{text:`Blast: ${m.mintName}`,callback_data:`blast:confirm:${m.id}`}]);
+  buttons.push([{text:"New URL",callback_data:"blast:menu"}]);
+  await send(chatId,`💣 Blast — ${wallets.length} wallets\n\nSelect a tracked mint to blast, or paste a new URL.`,{reply_markup:{inline_keyboard:buttons}});
+}
 
-  await safeSend(
-    chatId,
-    [
-      `${mint.mintName} gas check`,
-      "",
-      `Suggested max gas spend: ${estimate.gasCapEth} ETH`,
-      `Share of your total spend: ${estimate.gasPercent}`,
-      estimate.note ? `Note: ${estimate.note}` : "",
-      "",
-      "Use this amount, or reply with your own number like 0.015.",
-      "If gas goes above this amount at mint time, the bot will skip the buy instead of overpaying."
-    ].filter(Boolean).join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: `Use ${estimate.gasCapEth} ETH`, callback_data: `gascap:approve:${mint.id}` }],
-          [{ text: "Set My Own", callback_data: `gascap:custom:${mint.id}` }]
-        ]
+async function handleBlastUrl(chatId,text) {
+  const user=getUser(chatId); const os=parseOsUrl(text);
+  let contract=os.contractAddress||extractAddr(text); let chainId=os.chainId||defaultChain().chainId;
+  user.state={};
+  if (!contract&&os.slug) { try { const col=await fetchOsCollection(os.slug); contract=col.contractAddress; chainId=col.chainId||chainId; } catch { await send(chatId,"Couldn't resolve. Paste a contract address directly."); return; } }
+  if (!contract) { await send(chatId,"No contract found."); return; }
+  // Fire immediately — no second confirmation
+  const fakeMint=buildMintRecord({contractAddress:contract,chainId,chainName:defaultChain().chainName,userTier:"public",mintTime:Date.now(),priceEth:null},{quantity:1});
+  user.blastPending=fakeMint; saveDb();
+  await executeBlast(chatId,fakeMint.id);
+}
+
+async function executeBlast(chatId,mintId) {
+  const user=getUser(chatId); const wallets=user.wallets||[];
+  if (!wallets.length) { await send(chatId,"No wallets to blast from."); return; }
+  const mint=(user.mints||[]).find(m=>m.id===mintId)||user.blastPending;
+  if (!mint) { await send(chatId,"Blast mint not found."); return; }
+  await send(chatId,`💣 Blasting from ${wallets.length} wallets...`);
+  const results=await Promise.allSettled(wallets.map(w=>runAutoMint(chatId,user,mint,w)));
+  const ok=results.filter(r=>r.status==="fulfilled"); const fail=results.filter(r=>r.status==="rejected");
+  const lines=[`💣 Blast complete.`,``,`Confirmed: ${ok.length}/${wallets.length}`,...ok.map((r,i)=>`Wallet ${i+1}: ${r.value?.hash||"ok"}`)];
+  if (fail.length) { lines.push(``,`Failed: ${fail.length}`); fail.forEach((r,i)=>lines.push(`Wallet ${ok.length+i+1}: ${shortErr(r.reason)}`)); }
+  await send(chatId,lines.join("\n"));
+  user.blastPending=null; saveDb();
+}
+
+// ─── SCHEDULING / POLL ───────────────────────────────────────────────────────
+function scheduleMint(chatId,mint) {
+  if (!mint?.confirmed||!mint.autoMintEnabled||!mint.mintTime||!mint.contractAddress||mint.autoMint?.success) return;
+  const key=`${chatId}:${mint.id}`; if (mintTimers.has(key)) return;
+  const delay=Math.max(1000,Number(mint.mintTime)+AUTO_MINT_DELAY_MS-Date.now());
+  const t=setTimeout(async()=>{mintTimers.delete(key); await tryAutoMint(chatId,mint.id,"timer");},delay);
+  mintTimers.set(key,t); mint.autoMint=mint.autoMint||{}; mint.autoMint.scheduled=true; saveDb();
+}
+function clearMintTimer(chatId,mintId) { const k=`${chatId}:${mintId}`; const t=mintTimers.get(k); if(t) clearTimeout(t); mintTimers.delete(k); }
+
+function armAll() {
+  for (const [chatId,user] of Object.entries(db.users||{})) {
+    for (const mint of user.mints||[]) {
+      if (!mint.confirmed) continue;
+      scheduleMint(chatId,mint);
+      if (!mint.completedAt) {
+        if (!mint.autoMint?.success&&mint.mintTime&&Date.now()<Number(mint.mintTime)+RETRY_WINDOW_MS) startMempoolWatcher(chatId,mint);
+        if (mint._watcherState) startTopOfferWatcher(chatId,mint);
+        if (mint._mintedTokenIds?.length&&!mint._saleClosed) startSaleWatcher(chatId,mint);
       }
     }
-  );
-}
-
-async function approveRecommendedGasCap(chatId, mintId) {
-  const user = getUser(chatId);
-  const mint = user.pendingMint;
-
-  if (!mint || mint.id !== mintId) {
-    await safeSend(chatId, "That setup is gone. Start again with a fresh mint page.");
-    return;
-  }
-
-  mint.gasCapEth = mint.recommendedGasCapEth || mint.gasCapEth;
-  user.state = {};
-  saveDb();
-  await confirmMint(chatId, mintId);
-}
-
-async function handleCustomGasCap(chatId, text) {
-  const user = getUser(chatId);
-  const mintId = user.state && user.state.mintId;
-  const mint = user.pendingMint && user.pendingMint.id === mintId
-    ? user.pendingMint
-    : (user.mints || []).find((item) => item.id === mintId);
-  const value = parseEthAmount(text);
-
-  if (!mint || !value || value <= 0) {
-    await safeSend(chatId, "Send a clean amount like 0.015");
-    return;
-  }
-
-  mint.gasCapEth = String(value);
-  mint.updatedAt = Date.now();
-  user.state = {};
-  saveDb();
-
-  if (user.pendingMint && user.pendingMint.id === mintId) {
-    await confirmMint(chatId, mintId);
-  } else {
-    await safeSend(chatId, `Saved. Max gas spend is now ${value} ETH for ${mint.mintName}.`);
   }
 }
 
-async function handleTargetListPrice(chatId, text) {
-  const user = getUser(chatId);
-  const mintId = user.state && user.state.mintId;
-  const mint = findMintById(user, mintId) || user.pendingMint;
-  const value = parseEthAmount(text);
-
-  if (!mint || !value || value <= 0) {
-    await safeSend(chatId, "Send a clean sell price like 0.25");
-    return;
-  }
-
-  mint.targetListPriceEth = String(value);
-  mint.updatedAt = Date.now();
-  user.state = {};
-  saveDb();
-  await safeSend(chatId, `Saved. Sell target is now ${value} ETH for ${mint.mintName}.`);
-}
-
-async function handleListPrice(chatId, text) {
-  const user = getUser(chatId);
-  const tokenRecordId = user.state && user.state.tokenRecordId;
-  const token = findMintedToken(user, tokenRecordId);
-  const value = parseEthAmount(text);
-
-  if (!token || !value || value <= 0) {
-    await safeSend(chatId, "Send a clean sell price like 0.25");
-    return;
-  }
-
-  user.state = {};
-  saveDb();
-
-  try {
-    await safeSend(
-      chatId,
-      [
-        "Listing your item now.",
-        `Item: ${displayMintedTokenName(token)}`,
-        `Sell price: ${value} ETH`
-      ].join("\n")
-    );
-
-    const result = await createOpenSeaListing(user, token, value);
-    token.lastListedAt = Date.now();
-    token.lastListPriceEth = String(value);
-    token.lastListingOrderHash = result.orderHash || null;
-    token.updatedAt = Date.now();
-    saveDb();
-
-    await safeSend(
-      chatId,
-      [
-        "Your item is now listed.",
-        `Item: ${displayMintedTokenName(token)}`,
-        `Sell price: ${value} ETH`,
-        result.marketplace ? `Marketplace: ${result.marketplace}` : ""
-      ].filter(Boolean).join("\n"),
-      result.assetUrl
-        ? {
-            reply_markup: {
-              inline_keyboard: [[{ text: "View Listing", url: result.assetUrl }]]
-            }
-          }
-        : {}
-    );
-  } catch (err) {
-    await safeSend(chatId, userFriendlyError(err, "I could not finish the listing. Try again in a moment."));
-  }
-}
-
-async function handleProfitThreshold(chatId, text) {
-  const user = getUser(chatId);
-  const mintId = user.state && user.state.mintId;
-  const mint = findMintById(user, mintId) || user.pendingMint;
-  const value = Number(String(text).trim());
-
-  if (!mint || !Number.isFinite(value) || value <= 1) {
-    await safeSend(chatId, "Send a clean alert level above 1. Example: 2");
-    return;
-  }
-
-  mint.profitAlertMultiple = value;
-  mint.updatedAt = Date.now();
-  user.state = {};
-  saveDb();
-  await safeSend(chatId, `Saved. Profit ping is now ${value}x for ${mint.mintName}.`);
-}
-
-async function clearMints(chatId) {
-  const user = getUser(chatId);
-  for (const mint of user.mints || []) {
-    clearAutoMintTimer(chatId, mint.id);
-  }
-  user.mints = [];
-  user.pendingMint = null;
-  user.state = {};
-  saveDb();
-  await safeSend(chatId, "All live mints were cleared. Your wallets stayed exactly where they are.", MAIN_MENU_KEYBOARD);
-}
-
-function scheduleAutoMint(chatId, mint) {
-  if (!mint || !mint.confirmed || !mint.autoMintEnabled || !mint.mintTime) return;
-  if (mint.autoMint && mint.autoMint.success) return;
-  if (!mint.contractAddress) return;
-
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-  if (!wallet) return;
-
-  const fireAt = Number(mint.mintTime) + AUTO_MINT_DELAY_MS;
-  const now = Date.now();
-  const retryUntil = Number(mint.mintTime) + AUTO_MINT_RETRY_WINDOW_MS;
-
-  if (now > retryUntil) return;
-
-  const timerKey = timerKeyFor(chatId, mint.id);
-  if (activeAutoMintTimers.has(timerKey)) return;
-
-  const delay = Math.max(1000, fireAt - now);
-  const timer = setTimeout(async () => {
-    activeAutoMintTimers.delete(timerKey);
-    await maybeAttemptAutoMint(chatId, mint.id, "timer");
-  }, delay);
-
-  activeAutoMintTimers.set(timerKey, timer);
-  mint.autoMint = mint.autoMint || {};
-  mint.autoMint.scheduled = true;
-  saveDb();
-}
-
-function clearAutoMintTimer(chatId, mintId) {
-  const key = timerKeyFor(chatId, mintId);
-  const timer = activeAutoMintTimers.get(key);
-  if (timer) clearTimeout(timer);
-  activeAutoMintTimers.delete(key);
-}
-
-function armAllAutoMintTimers() {
-  for (const [chatId, user] of Object.entries(db.users || {})) {
-    for (const mint of user.mints || []) {
-      scheduleAutoMint(chatId, mint);
-    }
-  }
-}
-
-async function checkConfirmedMints() {
-  const now = Date.now();
-
-  for (const [chatId, user] of Object.entries(db.users || {})) {
-    for (const mint of user.mints || []) {
-      if (!mint.confirmed || !mint.mintTime) continue;
-
+async function pollLoop() {
+  const now=Date.now();
+  for (const [chatId,user] of Object.entries(db.users||{})) {
+    for (const mint of user.mints||[]) {
+      if (!mint.confirmed||!mint.mintTime) continue;
       if (mint.remindersEnabled) {
-        for (const reminder of REMINDERS) {
-          const dueAt = mint.mintTime - reminder.seconds * 1000;
-          const notTooLate = now < mint.mintTime + 60 * 60 * 1000;
-
-          if (now >= dueAt && notTooLate && !mint.firedReminders.includes(reminder.key)) {
-            mint.firedReminders.push(reminder.key);
-            mint.updatedAt = now;
-            saveDb();
-            await safeSend(
-              chatId,
-              `${reminder.label} reminder: ${mint.mintName} opens for you at ${formatDateTime(mint.mintTime)}.`
-            );
+        for (const r of REMINDERS) {
+          const due=mint.mintTime-r.seconds*1000;
+          if (now>=due&&now<mint.mintTime+3600000&&!mint.firedReminders.includes(r.key)) {
+            mint.firedReminders.push(r.key); mint.updatedAt=now; saveDb();
+            await send(chatId,`⏰ ${r.label} — ${mint.mintName} ${mint.userTier.toUpperCase()} opens at ${formatDt(mint.mintTime)}.`);
           }
         }
       }
-
-      if (now >= mint.mintTime && !mint.openAlertSent) {
-        mint.openAlertSent = true;
-        mint.updatedAt = now;
-        saveDb();
-        await safeSend(chatId, `${mint.mintName} is live for you now.`);
+      if (now>=mint.mintTime&&!mint.openAlertSent) {
+        mint.openAlertSent=true; mint.updatedAt=now; saveDb();
+        await send(chatId,`🔓 OPEN — ${mint.mintName} (${mint.userTier.toUpperCase()})\n\n${mint.autoMintEnabled?"Auto-mint firing now.":"Mint manually now."}`);
       }
-
-      if (mint.autoMintEnabled) {
-        await maybeAttemptAutoMint(chatId, mint.id, "poll");
-      }
+      if (mint.autoMintEnabled) await tryAutoMint(chatId,mint.id,"poll");
     }
   }
 }
 
-async function maybeAttemptAutoMint(chatId, mintId, source) {
-  const user = getUser(chatId);
-  const mint = (user.mints || []).find((item) => item.id === mintId);
-  if (!mint || !mint.confirmed || !mint.autoMintEnabled) return;
-
-  const autoMint = mint.autoMint || {};
-  mint.autoMint = autoMint;
-
-  if (autoMint.success || autoMint.inFlight) return;
-  if (Date.now() < mint.mintTime + AUTO_MINT_DELAY_MS) return;
-  if (Date.now() > mint.mintTime + AUTO_MINT_RETRY_WINDOW_MS) return;
-  if ((autoMint.attempts || 0) >= AUTO_MINT_MAX_ATTEMPTS) return;
-
-  const wallet = getActiveWallet(user);
-  if (!wallet || !mint.contractAddress) return;
-
-  autoMint.inFlight = true;
-  autoMint.attempts = (autoMint.attempts || 0) + 1;
-  autoMint.lastAttemptAt = Date.now();
-  autoMint.lastSource = source;
-  saveDb();
-
+async function tryAutoMint(chatId,mintId,source) {
+  const user=getUser(chatId); const mint=(user.mints||[]).find(m=>m.id===mintId);
+  if (!mint?.confirmed||!mint.autoMintEnabled) return;
+  const am=mint.autoMint||{}; mint.autoMint=am;
+  if (am.success||am.inFlight) return;
+  if (source!=="mempool"&&Date.now()<mint.mintTime+AUTO_MINT_DELAY_MS) return;
+  if (Date.now()>mint.mintTime+RETRY_WINDOW_MS) return;
+  if ((am.attempts||0)>=MAX_ATTEMPTS) return;
+  const wallet=activeWallet(user); if (!wallet||!mint.contractAddress) return;
+  am.inFlight=true; am.attempts=(am.attempts||0)+1; am.lastAt=Date.now(); am.lastSource=source; saveDb();
   try {
-    const result = await executeAutoMint(chatId, user, mint, wallet);
-    autoMint.success = true;
-    autoMint.inFlight = false;
-    autoMint.txHash = result.hash;
-    autoMint.confirmedAt = Date.now();
-    mint.completedAt = Date.now();
-    user.mintHistory = user.mintHistory || [];
-    user.mintHistory.unshift({
-      mintId: mint.id,
-      mintName: mint.mintName,
-      userTier: mint.userTier,
-      txHash: result.hash,
-      valueEth: result.valueEth || mint.priceEth || "0",
-      gasCostEth: result.gasCostEth || "0",
-      totalCostEth: String(Number(result.valueEth || mint.priceEth || 0) + Number(result.gasCostEth || 0)),
-      contractAddress: mint.contractAddress,
-      chainId: mint.chainId,
-      status: "confirmed",
-      timestamp: Date.now()
-    });
+    const result=await runAutoMint(chatId,user,mint,wallet);
+    am.success=true; am.inFlight=false; am.txHash=result.hash; am.doneAt=Date.now(); mint.completedAt=Date.now();
+    stopMempoolWatcher(mint.id);
+    user.mintHistory=user.mintHistory||[];
+    user.mintHistory.unshift({mintId:mint.id,mintName:mint.mintName,userTier:mint.userTier,txHash:result.hash,status:"confirmed",timestamp:Date.now(),priceEth:mint.priceEth});
+    lbAdd(chatId,"totalEthSpent",parseFloat(mint.priceEth||0)*(mint.quantity||1));
     saveDb();
-    await sendTxResult(chatId, `Buy landed: ${mint.mintName}`, result.hash, mint.chainId);
-    await watchMintedReceipt(chatId, user, mint, result.receipt);
-  } catch (err) {
-    autoMint.inFlight = false;
-    autoMint.lastError = shortError(err);
-    mint.updatedAt = Date.now();
+    await send(chatId,[
+      `✅ MINTED — ${mint.mintName}`,``,
+      `Phase: ${mint.userTier.toUpperCase()}`,
+      `Price: ${mint.priceEth||"?"} ETH × ${mint.quantity}`,
+      `Tx: ${result.hash}`
+    ].join("\n"));
+    await postMintActions(chatId,mint,result);
+  } catch(err) {
+    am.inFlight=false; am.lastError=shortErr(err); mint.updatedAt=Date.now();
+    const reason=classifyRevert(err);
+    if (reason==="sold_out") { mint.completedAt=Date.now(); saveDb(); await send(chatId,`Sold out — ${mint.mintName}.\n\nWatch secondaries.`); return; }
+    if (reason==="per_wallet"||reason==="wrong_phase") { saveDb(); return; }
     saveDb();
-
-    const attemptsLeft = AUTO_MINT_MAX_ATTEMPTS - autoMint.attempts;
-    const finalAttempt = attemptsLeft <= 0 || Date.now() > mint.mintTime + AUTO_MINT_RETRY_WINDOW_MS;
-    await safeSend(
-      chatId,
-      [
-        `Auto-buy attempt ${autoMint.attempts} did not land for ${mint.mintName}.`,
-        userFriendlyError(err),
-        finalAttempt ? "The retry window is over. Buy manually if you still want in." : `Attempts left: ${attemptsLeft}`
-      ].join("\n")
-    );
+    const left=MAX_ATTEMPTS-am.attempts; const done=left<=0||Date.now()>mint.mintTime+RETRY_WINDOW_MS;
+    await send(chatId,done?`Auto-mint stopped — ${mint.mintName}.\n\nReason: ${shortErr(err)}\n\nMint manually if you still want in.`:`Attempt ${am.attempts} failed — ${mint.mintName}.\n${shortErr(err)}\n\n${left} retries left.`);
   }
 }
 
-async function executeAutoMint(chatId, user, mint, walletRecord) {
-  if (!mint.contractAddress) {
-    throw new Error("Contract address is missing");
-  }
-  if (!walletRecord.encryptedPrivateKey) {
-    throw new Error("Active wallet has no encrypted private key");
-  }
-
-  const provider = getProvider(mint.chainId);
-  const privateKey = decryptPrivateKey(walletRecord.encryptedPrivateKey);
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const abi = await resolveContractAbi(mint);
-  const contract = new ethers.Contract(mint.contractAddress, abi, wallet);
-  const candidate = selectMintFunction(contract.interface, mint, wallet.address);
-
-  if (!candidate) {
-    throw new Error("No compatible mint function found. Add mintFunction/mintArgs manually.");
-  }
-
-  const value = resolveMintValue(mint);
-  const feeOverrides = await buildFeeOverrides(mint.chainId, {
-    riskMode: riskModeForMint(user, mint).key,
-    gasWarMode: Boolean(mint.gasWarMode || user.gasWarMode),
-    attempt: Number(mint.autoMint && mint.autoMint.attempts ? mint.autoMint.attempts : 1)
-  });
-  const gasLimit = await resolveGasLimit(contract, candidate, value);
-  const balance = await provider.getBalance(wallet.address);
-  const maxGasCost = feeOverrides.maxFeePerGas
-    ? gasLimit * feeOverrides.maxFeePerGas
-    : gasLimit * (feeOverrides.gasPrice || 0n);
-  const gasCap = mint.gasCapEth ? ethers.parseEther(String(mint.gasCapEth)) : null;
-  if (gasCap && maxGasCost > gasCap) {
-    throw new Error(`Gas cap exceeded. Current max gas ${ethers.formatEther(maxGasCost)} ETH is above your cap ${mint.gasCapEth} ETH.`);
-  }
-  const required = value + maxGasCost;
-
-  if (balance < required) {
-    throw new Error(`Insufficient ETH. Need about ${ethers.formatEther(required)} ETH, wallet has ${ethers.formatEther(balance)} ETH.`);
-  }
-
-  const overrides = { ...feeOverrides, gasLimit, value };
-  const fn = contract[candidate.functionKey];
-  if (!fn) {
-    throw new Error(`Function ${candidate.functionKey} is not available on contract`);
-  }
-
-  if (mint.flashbotsEnabled) {
-    const relayUrl = privateRelayUrl(mint.chainId);
-    if (!relayUrl) {
-      throw new Error("Private relay is enabled but no relay URL is configured for this chain");
-    }
-    const populated = await fn.populateTransaction(...candidate.args, overrides);
-    const txRequest = {
-      ...populated,
-      chainId: mint.chainId,
-      nonce: await wallet.getNonce("pending")
-    };
-    const rawTx = await wallet.signTransaction(txRequest);
-    const hash = await sendPrivateRawTransaction(relayUrl, rawTx);
-    await sendTxResult(chatId, `Private auto-mint submitted: ${mint.mintName}`, hash, mint.chainId);
-    const receipt = await provider.waitForTransaction(hash, 1, 180000);
-    if (!receipt || receipt.status !== 1) {
-      throw new Error(`Private transaction not confirmed: ${hash}`);
-    }
-    return { hash, receipt, valueEth: ethers.formatEther(value), gasCostEth: ethers.formatEther(maxGasCost) };
-  }
-
-  const pendingFeeWei = pendingFeeWeiForChain(user, mint.chainId);
-  const canBundlePendingFee = pendingFeeWei > 0n && canRouteMintWithFee(mint, candidate);
-  if (canBundlePendingFee) {
-    const routed = await executeRoutedMint({
-      chatId,
-      user,
-      mint,
-      wallet,
-      provider,
-      contract,
-      candidate,
-      mintValue: value,
-      pendingFeeWei,
-      feeOverrides,
-      gasCap
-    });
-    clearPendingFeesForChain(user, mint.chainId);
-    return routed;
-  }
-
-  const tx = await fn(...candidate.args, overrides);
-    await sendTxResult(chatId, `Buy sent: ${mint.mintName}`, tx.hash, mint.chainId);
-  const receipt = await tx.wait(1);
-
-  if (!receipt || receipt.status !== 1) {
-    throw new Error(`Transaction reverted: ${tx.hash}`);
-  }
-
-  if (pendingFeeWei > 0n && Number(mint.chainId) === 1 && !canBundlePendingFee) {
-    await settlePendingProfitAgreementsAfterMint(chatId, user, mint, wallet, pendingFeeWei).catch(async (err) => {
-      await safeSend(
-        chatId,
-        [
-          `${mint.mintName} landed.`,
-          "Your pending profit agreement is still waiting.",
-          "The bot will try again after your next Ethereum buy."
-        ].join("\n")
-      );
-      console.error("pending profit agreement settle failed:", err);
-    });
-  }
-
-  return { hash: tx.hash, receipt, valueEth: ethers.formatEther(value), gasCostEth: ethers.formatEther(maxGasCost) };
+function classifyRevert(err) {
+  const msg=(err?.message||String(err)).toLowerCase();
+  if (REVERT_SOLD_OUT.some(k=>msg.includes(k)))    return "sold_out";
+  if (REVERT_PER_WALLET.some(k=>msg.includes(k)))  return "per_wallet";
+  if (REVERT_WRONG_PHASE.some(k=>msg.includes(k))) return "wrong_phase";
+  return "unknown";
 }
 
-function privateRelayUrl(chainId) {
-  if (Number(chainId) === 1) {
-    return process.env.FLASHBOTS_RELAY_ETH
-      || process.env.FLASHBOTS_PROTECT_ETH
-      || process.env.PRIVATE_TX_RPC_ETH
-      || "https://rpc.flashbots.net";
+// ─── EXECUTE MINT ─────────────────────────────────────────────────────────────
+async function runAutoMint(chatId,user,mint,walletRecord) {
+  if (!mint.contractAddress) throw new Error("No contract address.");
+  if (!walletRecord.encKey)  throw new Error("Wallet has no key.");
+  const provider=getProvider(mint.chainId); const key=decryptKey(walletRecord.encKey);
+  const rpcUrl=mint.flashbotsEnabled?(CHAIN[mint.chainId===1?"ethereum":"base"]?.flashbotsRpc||null):null;
+  const sigProv=rpcUrl?new ethers.JsonRpcProvider(rpcUrl,mint.chainId):provider.getActive();
+  const signer=new ethers.Wallet(key,sigProv);
+  const abi=await resolveAbi(mint); const contract=new ethers.Contract(mint.contractAddress,abi,signer);
+  const cand=pickMintFn(contract.interface,mint,signer.address);
+  if (!cand) throw new Error("No mint function found. Contract may use a custom ABI.");
+  const value=mintValue(mint); const feeData=await provider.getFeeData();
+  const attempt=mint.autoMint?.attempts||0; const useWar=mint.gasWarMode||user.gasWarMode;
+  const gas=buildGas(feeData,useWar,attempt);
+  if (mint._userGasCap) {
+    const capWei=ethers.parseEther(String(mint._userGasCap));
+    const limit=await resolveGasLimit(contract,cand,value);
+    const cost=limit*(gas.maxFeePerGas||gas.gasPrice||0n);
+    if (cost>capWei) throw new Error(`Gas cap hit. Estimated: ${ethers.formatEther(cost)} ETH, cap: ${mint._userGasCap} ETH.`);
   }
-  if (Number(chainId) === 8453) {
-    return process.env.FLASHBOTS_PROTECT_BASE
-      || process.env.PRIVATE_TX_RPC_BASE
-      || "";
-  }
-  return "";
+  const gasLimit=await resolveGasLimit(contract,cand,value);
+  const balance=await provider.getBalance(signer.address);
+  const maxCost=gasLimit*(gas.maxFeePerGas||gas.gasPrice||0n);
+  const pendingFeeWei=await collectPendingFee(chatId,user,value,signer,mint.chainId);
+  const totalValue=value+pendingFeeWei;
+  if (balance<totalValue+maxCost) throw new Error(`Not enough ETH. Need ~${ethers.formatEther(totalValue+maxCost)}, have ${ethers.formatEther(balance)}.`);
+  const tx=await contract[cand.functionKey](...cand.args,{...gas,gasLimit,value:totalValue});
+  const receipt=await tx.wait(1);
+  if (!receipt||receipt.status!==1) throw new Error(`Reverted: ${tx.hash}`);
+  return {hash:tx.hash,receipt};
 }
 
-async function sendPrivateRawTransaction(relayUrl, rawTx) {
-  const payload = {
-    jsonrpc: "2.0",
-    id: Date.now(),
-    method: "eth_sendRawTransaction",
-    params: [rawTx]
-  };
-  const response = await fetch(relayUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data || data.error) {
-    throw new Error(data && data.error ? data.error.message || JSON.stringify(data.error) : `Private relay HTTP ${response.status}`);
-  }
-  return data.result;
+function buildGas(feeData,warMode,attempt) {
+  const step=warMode?(100n+GAS_WAR_STEP*BigInt(attempt)):100n;
+  const boost=(BASE_GAS_BOOST*step)/100n;
+  if (feeData.maxFeePerGas&&feeData.maxPriorityFeePerGas) return {maxFeePerGas:(BigInt(feeData.maxFeePerGas)*boost)/100n,maxPriorityFeePerGas:(BigInt(feeData.maxPriorityFeePerGas)*boost)/100n};
+  if (feeData.gasPrice) return {gasPrice:(BigInt(feeData.gasPrice)*boost)/100n};
+  return {};
 }
 
-function canRouteMintWithFee(mint, candidate) {
-  if (!hasFeeRouter(mint.chainId)) return false;
-  return candidate.fragment.inputs.some((input) => input.type === "address");
+// ─── POST-MINT / RARITY ───────────────────────────────────────────────────────
+async function postMintActions(chatId,mint,result) {
+  const tokenId=extractTokenId(result.receipt);
+  if (tokenId!==null) {
+    mint._lastMintedTokenId=String(tokenId); mint._mintedTokenIds=mint._mintedTokenIds||[];
+    if (!mint._mintedTokenIds.includes(String(tokenId))) mint._mintedTokenIds.push(String(tokenId));
+    saveDb(); await sendRarityAlert(chatId,mint,String(tokenId));
+  }
+  startTopOfferWatcher(chatId,mint); startSaleWatcher(chatId,mint);
 }
 
-function hasMintRegistry(chainId) {
-  const registryAddress = MINT_REGISTRY_BY_CHAIN[Number(chainId)];
-  return Boolean(registryAddress && ethers.isAddress(registryAddress));
-}
-
-function hasFeeRouter(chainId) {
-  const routerAddress = FEE_ROUTER_BY_CHAIN[Number(chainId)];
-  return Boolean(routerAddress && ethers.isAddress(routerAddress));
-}
-
-async function executeRoutedMint({
-  chatId,
-  user,
-  mint,
-  wallet,
-  provider,
-  contract,
-  candidate,
-  mintValue,
-  pendingFeeWei,
-  feeOverrides,
-  gasCap
-}) {
-  const routerAddress = FEE_ROUTER_BY_CHAIN[Number(mint.chainId)];
-  const router = new ethers.Contract(routerAddress, FEE_ROUTER_ABI, wallet);
-  const mintCallData = contract.interface.encodeFunctionData(candidate.fragment, candidate.args);
-  const totalValue = mintValue + pendingFeeWei;
-  let gasLimit = DEFAULT_GAS_LIMIT + 150000n;
-
-  try {
-    const estimated = await router.routeMint.estimateGas(
-      mint.contractAddress,
-      mintCallData,
-      mintValue,
-      pendingFeeWei,
-      0,
-      wallet.address,
-      { value: totalValue }
-    );
-    gasLimit = (estimated * 130n) / 100n;
-  } catch (err) {
-    // Use conservative fallback.
+function extractTokenId(receipt) {
+  if (!receipt?.logs) return null;
+  const TRANSFER="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+  for (const log of receipt.logs) {
+    if (log.topics?.[0]===TRANSFER&&log.topics.length===4) { try { return BigInt(log.topics[3]).toString(); } catch {} }
   }
-
-  const maxGasCost = feeOverrides.maxFeePerGas
-    ? gasLimit * feeOverrides.maxFeePerGas
-    : gasLimit * (feeOverrides.gasPrice || 0n);
-
-  if (gasCap && maxGasCost > gasCap) {
-    throw new Error(`Gas cap exceeded. Current max gas ${ethers.formatEther(maxGasCost)} ETH is above your cap ${mint.gasCapEth} ETH.`);
-  }
-
-  const balance = await provider.getBalance(wallet.address);
-  if (balance < totalValue + maxGasCost) {
-    throw new Error(`Insufficient ETH. Need about ${ethers.formatEther(totalValue + maxGasCost)} ETH, wallet has ${ethers.formatEther(balance)} ETH.`);
-  }
-
-  const tx = await router.routeMint(
-    mint.contractAddress,
-    mintCallData,
-    mintValue,
-    pendingFeeWei,
-    0,
-    wallet.address,
-    { ...feeOverrides, gasLimit, value: totalValue }
-  );
-  await sendTxResult(chatId, `Buy sent: ${mint.mintName}`, tx.hash, mint.chainId);
-  const receipt = await tx.wait(1);
-
-  if (!receipt || receipt.status !== 1) {
-    throw new Error(`Transaction reverted: ${tx.hash}`);
-  }
-
-  db.totalFeesCollectedEth = String(Number(db.totalFeesCollectedEth || 0) + Number(ethers.formatEther(pendingFeeWei)));
-
-  return {
-    hash: tx.hash,
-    receipt,
-    valueEth: ethers.formatEther(totalValue),
-    gasCostEth: ethers.formatEther(maxGasCost)
-  };
-}
-
-async function watchMintedReceipt(chatId, user, mint, receipt) {
-  const transferTopic = ethers.id("Transfer(address,address,uint256)");
-  const zeroTopic = ethers.zeroPadValue("0x", 32).toLowerCase();
-  const activeWallet = getActiveWallet(user);
-  const walletTopic = activeWallet
-    ? ethers.zeroPadValue(activeWallet.address, 32).toLowerCase()
-    : null;
-
-  user.mintedTokens = user.mintedTokens || [];
-  for (const log of receipt.logs || []) {
-    if (!log.topics || log.topics[0] !== transferTopic) continue;
-    if (log.address.toLowerCase() !== String(mint.contractAddress || "").toLowerCase()) continue;
-    if (log.topics[1] && log.topics[1].toLowerCase() !== zeroTopic) continue;
-    if (walletTopic && log.topics[2] && log.topics[2].toLowerCase() !== walletTopic) continue;
-
-    const tokenId = BigInt(log.topics[3]).toString();
-    const tokenRecord = {
-      id: randomId(8),
-      mintId: mint.id,
-      mintName: mint.mintName,
-      contractAddress: ethers.getAddress(log.address),
-      chainId: mint.chainId,
-      tokenId,
-      ownerWalletAddress: activeWallet ? activeWallet.address : null,
-      sourceUrl: mint.sourceUrl || null,
-      openSeaSlug: mint.openSeaSlug || (mint.metadata && mint.metadata.slug) || null,
-      mintPriceEth: mint.priceEth || mint.totalValueEth || "0",
-      mintedAt: Date.now(),
-      txHash: receipt.hash,
-      watchingSale: true,
-      profitAlertsSent: [],
-      lossAlertsSent: []
-    };
-    user.mintedTokens.push(tokenRecord);
-    saveDb();
-    await sendMintedTokenMarketCard(chatId, tokenRecord.id, { refresh: true, source: "post_mint" });
-  }
-}
-
-async function sendMintedTokenMarketCard(chatId, tokenRecordId, options = {}) {
-  const user = getUser(chatId);
-  const token = findMintedToken(user, tokenRecordId);
-
-  if (!token) {
-    await safeSend(chatId, "I could not find that item anymore.");
-    return;
-  }
-
-  const details = await fetchOpenSeaNftDetails(token).catch(() => null);
-  if (details) {
-    hydrateMintedToken(token, details);
-    saveDb();
-  }
-
-  const lines = [
-    `${options.source === "post_mint" ? "Mint landed" : "Market Card"}`,
-    `Item: ${displayMintedTokenName(token)}`,
-    token.collectionName ? `Collection: ${token.collectionName}` : "",
-    token.rarityRank
-      ? `Rarity: #${token.rarityRank}${token.rarityMaxRank ? ` of ${token.rarityMaxRank}` : ""}`
-      : "Rarity: not available yet",
-    rarityPositionLine(token),
-    rarityRecommendationLine(token),
-    "",
-    "Use the buttons below to view rarity again or list this item."
-  ].filter(Boolean);
-
-  const buttons = [];
-  if (token.assetUrl) {
-    buttons.push([{ text: "Open Item", url: token.assetUrl }]);
-  }
-  buttons.push([
-    { text: "View Rarity", callback_data: `token_rarity:${token.id}` },
-    { text: "List for Sale", callback_data: `token_list:${token.id}` }
-  ]);
-
-  await safeSend(chatId, lines.join("\n"), {
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
-
-async function handleSaleDetected(event) {
-  const chainId = Number(event.chainId || event.chain_id || getDefaultChainConfig().chainId);
-  const contractAddress = event.contractAddress || event.contract_address || event.nftContract || event.address;
-  const tokenId = event.tokenId || event.token_id || event.identifier;
-  const salePriceEth = event.salePriceEth || event.priceEth || event.price;
-
-  if (!contractAddress || tokenId == null || salePriceEth == null) return;
-
-  for (const [chatId, user] of Object.entries(db.users || {})) {
-    const token = (user.mintedTokens || []).find((item) => (
-      item.chainId === chainId
-      && String(item.contractAddress).toLowerCase() === String(contractAddress).toLowerCase()
-      && String(item.tokenId) === String(tokenId)
-    ));
-    if (!token) continue;
-
-    const mintPriceRecord = await resolveMintPriceSource(chainId, contractAddress, token).catch(() => null);
-    if (!mintPriceRecord || mintPriceRecord.mintPriceEth == null) {
-      token.lastSalePriceEth = String(salePriceEth);
-      token.soldAt = Date.now();
-      token.feeCollectionError = "Mint price not verified";
-      await safeSend(
-        chatId,
-        [
-          `Your NFT sold for ${salePriceEth} ETH.`,
-          "The bot could not verify the original buy price, so no profit agreement was created."
-        ].join("\n")
-      );
-      continue;
-    }
-
-    const mintPrice = Number(mintPriceRecord.mintPriceEth);
-    const salePrice = Number(salePriceEth || 0);
-    const profit = salePrice - mintPrice;
-    const fee = profit > 0 ? (profit * Number(PLATFORM_PROFIT_FEE_BPS)) / 10000 : 0;
-
-    token.mintPriceSource = mintPriceRecord && mintPriceRecord.source ? mintPriceRecord.source : "database";
-    token.lastSalePriceEth = String(salePrice);
-    token.soldAt = Date.now();
-    token.platformFeeEth = String(Math.max(0, fee));
-
-    if (fee > 0 && chainId === 8453) {
-      await collectBaseProfitFee(chatId, user, token, fee).catch((err) => {
-        token.feeCollectionError = shortError(err);
-      });
-      await safeSend(
-        chatId,
-        [
-          `Your NFT sold for ${salePrice} ETH.`,
-          `Mint price: ${mintPrice} ETH.`,
-          `Profit: ${profit} ETH.`,
-          `Platform fee collected: ${fee} ETH (5% of profit).`
-        ].join("\n")
-      );
-    } else if (fee > 0 && chainId === 1) {
-      user.pendingFees = user.pendingFees || [];
-      user.pendingFees.push({
-        chainId,
-        contractAddress: token.contractAddress,
-        tokenId: token.tokenId,
-        nftName: displayMintedTokenName(token),
-        salePriceEth: String(salePrice),
-        mintPriceEth: String(mintPrice),
-        profitEth: String(profit),
-        feeEth: String(fee),
-        createdAt: Date.now()
-      });
-      await safeSend(
-        chatId,
-        `Your NFT sold for ${salePrice} ETH. Profit: ${profit} ETH. Pending profit agreement from ${displayMintedTokenName(token)} NFT: ${fee} ETH (5% of profit). To save gas on Ethereum, this will carry into your next mint.`
-      );
-    } else {
-      await safeSend(
-        chatId,
-        [
-          `Your NFT sold for ${salePrice} ETH.`,
-          `Mint price: ${mintPrice} ETH.`,
-          "No platform fee because this sale was break-even or a loss."
-        ].join("\n")
-      );
-    }
-  }
-
-  saveDb();
-}
-
-async function readMintRegistryRecord(chainId, contractAddress, tokenId) {
-  if (!hasMintRegistry(chainId)) return null;
-  const registryAddress = MINT_REGISTRY_BY_CHAIN[Number(chainId)];
-
-  const provider = getProvider(chainId);
-  const registry = new ethers.Contract(
-    registryAddress,
-    ["function getMint(address nftContract, uint256 tokenId) view returns (address minter, uint256 mintPriceWei, uint256 recordedAt)"],
-    provider
-  );
-  const [minter, mintPriceWei, recordedAt] = await registry.getMint(contractAddress, BigInt(tokenId));
-  if (!minter || minter === ethers.ZeroAddress || !mintPriceWei) return null;
-  return {
-    minter,
-    mintPriceEth: ethers.formatEther(mintPriceWei),
-    recordedAt: Number(recordedAt)
-  };
-}
-
-async function resolveMintPriceSource(chainId, contractAddress, token) {
-  const dbRecord = token && token.mintPriceEth != null
-    ? {
-        mintPriceEth: token.mintPriceEth,
-        source: "database"
-      }
-    : null;
-
-  if (!hasMintRegistry(chainId)) {
-    return dbRecord;
-  }
-
-  const registryRecord = await readMintRegistryRecord(chainId, contractAddress, token.tokenId).catch(() => null);
-  if (registryRecord && registryRecord.mintPriceEth != null) {
-    return {
-      mintPriceEth: registryRecord.mintPriceEth,
-      source: "registry"
-    };
-  }
-
-  return dbRecord;
-}
-
-async function settlePendingProfitAgreementsAfterMint(chatId, user, mint, wallet, pendingFeeWei) {
-  if (!TREASURY_WALLET || !ethers.isAddress(TREASURY_WALLET)) {
-    throw new Error("TREASURY_WALLET is not configured");
-  }
-  if (pendingFeeWei <= 0n) return null;
-
-  const balance = await wallet.provider.getBalance(wallet.address);
-  const feeData = await wallet.provider.getFeeData();
-  const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || ethers.parseUnits("8", "gwei");
-  const gasLimit = 21000n;
-  const gasCost = gasLimit * gasPrice;
-
-  if (balance < pendingFeeWei + gasCost) {
-    throw new Error("Not enough ETH left to settle pending profit agreement");
-  }
-
-  const tx = await wallet.sendTransaction({
-    to: TREASURY_WALLET,
-    value: pendingFeeWei,
-    gasLimit,
-    ...(feeData.maxFeePerGas && feeData.maxPriorityFeePerGas
-      ? {
-          maxFeePerGas: feeData.maxFeePerGas,
-          maxPriorityFeePerGas: feeData.maxPriorityFeePerGas
-        }
-      : feeData.gasPrice
-        ? { gasPrice: feeData.gasPrice }
-        : {})
-  });
-  const receipt = await tx.wait(1);
-
-  if (!receipt || receipt.status !== 1) {
-    throw new Error("Pending profit agreement transfer did not confirm");
-  }
-
-  const settledEth = trimEth(ethers.formatEther(pendingFeeWei));
-  clearPendingFeesForChain(user, mint.chainId);
-  db.totalFeesCollectedEth = String(Number(db.totalFeesCollectedEth || 0) + Number(settledEth));
-  saveDb();
-
-  await safeSend(
-    chatId,
-    [
-      `${mint.mintName} landed.`,
-      `Pending profit agreement settled: ${settledEth} ETH`
-    ].join("\n"),
-    explorerTxUrl(mint.chainId, tx.hash)
-      ? {
-          reply_markup: {
-            inline_keyboard: [[{ text: "View Settlement", url: explorerTxUrl(mint.chainId, tx.hash) }]]
-          }
-        }
-      : {}
-  );
-
-  return receipt;
-}
-
-async function collectBaseProfitFee(chatId, user, token, feeEth) {
-  if (!TREASURY_WALLET || !ethers.isAddress(TREASURY_WALLET)) {
-    throw new Error("TREASURY_WALLET is not configured");
-  }
-  const walletRecord = getActiveWallet(user);
-  if (!walletRecord || !walletRecord.encryptedPrivateKey) {
-    throw new Error("No active wallet to collect fee from");
-  }
-
-  const provider = getProvider(8453);
-  const wallet = new ethers.Wallet(decryptPrivateKey(walletRecord.encryptedPrivateKey), provider);
-  const value = ethers.parseEther(String(feeEth));
-  const tx = await wallet.sendTransaction({ to: TREASURY_WALLET, value });
-  const receipt = await tx.wait(1);
-  token.feeTxHash = tx.hash;
-  db.totalFeesCollectedEth = String(Number(db.totalFeesCollectedEth || 0) + Number(feeEth));
-  return receipt;
-}
-
-async function handleAlchemyWebhook(payload) {
-  const events = extractAlchemyEvents(payload);
-  for (const event of events) {
-    if (event.type === "sale") {
-      await handleSaleDetected(event);
-    }
-  }
-}
-
-function extractAlchemyEvents(payload) {
-  const events = [];
-  const activity = payload.event && Array.isArray(payload.event.activity)
-    ? payload.event.activity
-    : Array.isArray(payload.activity)
-      ? payload.activity
-      : [];
-
-  for (const item of activity) {
-    const category = String(item.category || item.type || "").toLowerCase();
-    const contractAddress = item.contractAddress || item.rawContract && item.rawContract.address;
-    const tokenId = item.tokenId || item.erc721TokenId || item.token_id;
-    const chainId = normalizeWebhookChainId(item.network || item.chain || item.chainId || payload.network);
-
-    if (category.includes("sale") || item.eventType === "OrderFulfilled") {
-      events.push({
-        type: "sale",
-        chainId,
-        contractAddress,
-        tokenId,
-        salePriceEth: item.price || item.salePrice || item.value || item.ethValue
-      });
-    }
-  }
-
-  const logs = payload.event && Array.isArray(payload.event.logs)
-    ? payload.event.logs
-    : Array.isArray(payload.logs)
-      ? payload.logs
-      : [];
-
-  for (const log of logs) {
-    const topic0 = Array.isArray(log.topics) ? log.topics[0] : null;
-    if (topic0 !== ethers.id("OrderFulfilled(bytes32,address,address,address,(uint8,address,uint256,uint256)[],(uint8,address,uint256,uint256,address)[])")) {
-      continue;
-    }
-    events.push({
-      type: "sale",
-      chainId: normalizeWebhookChainId(log.network || payload.network || payload.chainId),
-      contractAddress: log.contractAddress || log.address,
-      tokenId: log.tokenId,
-      salePriceEth: log.salePriceEth || log.priceEth
-    });
-  }
-
-  return events.filter((event) => event.contractAddress && event.tokenId != null && event.salePriceEth != null);
-}
-
-function normalizeWebhookChainId(value) {
-  if (!value) return getDefaultChainConfig().chainId;
-  if (Number.isFinite(Number(value))) return Number(value);
-  const normalized = String(value).toLowerCase();
-  if (normalized.includes("base")) return 8453;
-  if (normalized.includes("eth")) return 1;
-  return getDefaultChainConfig().chainId;
-}
-
-async function resolveContractAbi(mint) {
-  if (!process.env.ETHERSCAN_API_KEY) {
-    return COMMON_MINT_ABI;
-  }
-
-  try {
-    const url = new URL("https://api.etherscan.io/v2/api");
-    url.searchParams.set("chainid", String(mint.chainId || getDefaultChainConfig().chainId));
-    url.searchParams.set("module", "contract");
-    url.searchParams.set("action", "getabi");
-    url.searchParams.set("address", mint.contractAddress);
-    url.searchParams.set("apikey", process.env.ETHERSCAN_API_KEY);
-
-    const data = await fetchJson(url.toString());
-    if (data.status !== "1") {
-      return COMMON_MINT_ABI;
-    }
-
-    return JSON.parse(data.result);
-  } catch (err) {
-    return COMMON_MINT_ABI;
-  }
-}
-
-function selectMintFunction(iface, mint, walletAddress) {
-  const fragments = iface.fragments
-    .filter((fragment) => fragment.type === "function")
-    .filter((fragment) => ["payable", "nonpayable"].includes(fragment.stateMutability));
-
-  const explicit = mint.mintFunction
-    ? fragments.filter((fragment) => fragment.name.toLowerCase() === mint.mintFunction.toLowerCase())
-    : [];
-
-  const common = fragments
-    .filter((fragment) => MINT_FUNCTION_PRIORITY.includes(fragment.name))
-    .sort((a, b) => MINT_FUNCTION_PRIORITY.indexOf(a.name) - MINT_FUNCTION_PRIORITY.indexOf(b.name));
-
-  const candidates = [...explicit, ...common];
-  const seen = new Set();
-
-  for (const fragment of candidates) {
-    const functionKey = fragment.format("sighash");
-    if (seen.has(functionKey)) continue;
-    seen.add(functionKey);
-
-    const args = buildMintArgs(fragment, mint, walletAddress);
-    if (!args) continue;
-
-    return { fragment, functionKey, args };
-  }
-
   return null;
 }
 
-function buildMintArgs(fragment, mint, walletAddress) {
-  if (Array.isArray(mint.mintArgs)) {
-    return mint.mintArgs;
+async function sendRarityAlert(chatId,mint,tokenId) {
+  let rarity=null; try { rarity=await fetchRarity(mint.contractAddress,tokenId,mint.chainId); } catch {}
+  const isRare=rarity?.rank&&rarity?.totalSupply?rarity.rank<=rarity.totalSupply*0.1:null;
+  const lines=[
+    `${mint.mintName} #${tokenId}`,"",
+    rarity?.rank?`Rank: #${rarity.rank}`+(rarity.totalSupply?` of ${rarity.totalSupply}`:""):null,
+    rarity?.score?`Score: ${rarity.score}`:null,"",
+    isRare===true?"🔥 RARE. Hold.":null,
+    isRare===false?"Common. Consider listing.":null,
+    isRare===null?"Rarity data loading — check back.":null
+  ].filter(l=>l!==null);
+  // Top offer watcher starts automatically — no button needed
+  await send(chatId,lines.join("\n"),{reply_markup:{inline_keyboard:[
+    [{text:"📤 List for Sale",callback_data:`list_for_sale:${mint.id}`}]
+  ]}});
+}
+
+async function fetchRarity(contractAddress,tokenId,chainId) {
+  if (!process.env.OPENSEA_API_KEY) return null;
+  try {
+    const chain=chainId===8453?"base":"ethereum";
+    const data=await fetchJson(`https://api.opensea.io/api/v2/chain/${chain}/contract/${contractAddress}/nfts/${tokenId}`,osHeaders());
+    const nft=data.nft||data;
+    return {rank:nft.rarity_rank||null,score:nft.rarity_score||null,totalSupply:null};
+  } catch { return null; }
+}
+
+async function showRarity(chatId,mint,tokenId) {
+  const r=await fetchRarity(mint.contractAddress,tokenId,mint.chainId);
+  if (!r) { await send(chatId,"Rarity data not available for this collection yet."); return; }
+  const lines=[`${mint.mintName} #${tokenId}`,""]; if(r.rank) lines.push(`Rank: #${r.rank}`); if(r.score) lines.push(`Score: ${r.score}`);
+  await send(chatId,lines.join("\n"));
+}
+
+// ─── TOP OFFER WATCHER ───────────────────────────────────────────────────────
+function startTopOfferWatcher(chatId,mint) {
+  if (!mint.openSeaSlug&&!mint.contractAddress) return;
+  const key=`${chatId}:${mint.id}`; if (topOfferWatchers.has(key)) return;
+  if (!mint._watcherState) { mint._watcherState={fired:[],fired50:false,fired75:false}; saveDb(); }
+  topOfferWatchers.set(key,true);
+}
+function stopTopOfferWatcher(chatId,mintId) { topOfferWatchers.delete(`${chatId}:${mintId}`); }
+
+async function checkTopOffers() {
+  for (const [key] of topOfferWatchers) {
+    const [chatId,mintId]=key.split(":");
+    const user=getUser(chatId); const mint=(user.mints||[]).find(m=>m.id===mintId);
+    if (!mint||mint.completedAt) { topOfferWatchers.delete(key); continue; }
+    try { await checkOneTopOffer(chatId,mint); } catch {}
   }
+}
 
-  const args = [];
-  for (const input of fragment.inputs) {
-    const type = input.type;
-
-    if (/^uint/.test(type)) {
-      args.push(BigInt(mint.quantity || 1));
-      continue;
+async function checkOneTopOffer(chatId,mint) {
+  if (!process.env.OPENSEA_API_KEY||!mint.openSeaSlug) return;
+  const stats=await fetchJson(`https://api.opensea.io/api/v2/collections/${encodeURIComponent(mint.openSeaSlug)}/stats`,osHeaders()).catch(()=>null);
+  if (!stats) return;
+  const floor=parseFloat(stats.total?.floor_price||stats.floor_price||0);
+  const topOffer=parseFloat(stats.total?.top_bid||stats.top_bid||0);
+  const mintPrice=parseFloat(mint.priceEth||0);
+  if (!mintPrice||!topOffer) return;
+  const state=mint._watcherState||{fired:[],fired50:false,fired75:false}; mint._watcherState=state;
+  const startAt=mint.profitAlertStart||2;
+  const multiple=Math.floor(topOffer/mintPrice);
+  for (let m=startAt;m<=multiple;m++) {
+    if (!state.fired.includes(m)) {
+      state.fired.push(m);
+      const profit=topOffer-mintPrice; const profitPct=((profit/mintPrice)*100).toFixed(1);
+      const osLink=mint.contractAddress?`https://opensea.io/assets/${mint.chainId===8453?"base":"ethereum"}/${mint.contractAddress}/${mint._lastMintedTokenId||""}`:null;
+      await send(chatId,[`🚀 ${m}x — ${mint.mintName}`,``,`Top offer: ${topOffer} ETH`,`Floor: ${floor} ETH`,`Mint price: ${mintPrice} ETH`,`Profit: +${profit.toFixed(4)} ETH (+${profitPct}%)`,osLink?`\nAccept on OpenSea: ${osLink}`:``].filter(l=>l!=="").join("\n"),
+        {reply_markup:{inline_keyboard:[
+          [{text:"📤 List for Sale",callback_data:`list_for_sale:${mint.id}`}],
+          [{text:"🛑 Stop Watching",callback_data:`stop_watching:${mint.id}`}]
+        ]}});
     }
+  }
+  if (topOffer<mintPrice) {
+    const lossPct=((mintPrice-topOffer)/mintPrice)*100;
+    const lossMsg=(pct)=>[`📉 -${pct}% — ${mint.mintName}`,``,`Top offer: ${topOffer} ETH`,`Mint price: ${mintPrice} ETH`,`Loss: -${(mintPrice-topOffer).toFixed(4)} ETH`].join("\n");
+    const lossKb={reply_markup:{inline_keyboard:[[{text:"📤 List for Sale",callback_data:`list_for_sale:${mint.id}`}],[{text:"🛑 Stop Watching",callback_data:`stop_watching:${mint.id}`}]]}};
+    if (lossPct>=75&&!state.fired75) { state.fired75=true; await send(chatId,lossMsg(75),lossKb); }
+    else if (lossPct>=50&&!state.fired50) { state.fired50=true; await send(chatId,lossMsg(50),lossKb); }
+  }
+  if (mint.targetListPrice&&floor>=parseFloat(mint.targetListPrice)&&!state.targetFired) {
+    state.targetFired=true;
+    await send(chatId,[`🎯 Floor hit your target — ${mint.mintName}`,``,`Floor: ${floor} ETH`,`Target: ${mint.targetListPrice} ETH`].join("\n"),
+      {reply_markup:{inline_keyboard:[[{text:"📤 List at Target",callback_data:`list_for_sale:${mint.id}`}]]}});
+  }
+  saveDb();
+}
 
-    if (type === "address") {
-      args.push(walletAddress);
-      continue;
+// ─── SALE WATCHER ────────────────────────────────────────────────────────────
+function startSaleWatcher(chatId,mint) { if (!mint.contractAddress) return; const key=`${chatId}:${mint.id}`; if (!saleWatchers.has(key)) saleWatchers.set(key,true); }
+function stopSaleWatcher(chatId,mintId) { saleWatchers.delete(`${chatId}:${mintId}`); }
+
+async function checkSales() {
+  for (const [key] of saleWatchers) {
+    const [chatId,mintId]=key.split(":");
+    const user=getUser(chatId); const mint=(user.mints||[]).find(m=>m.id===mintId);
+    if (!mint||mint._saleClosed) { saleWatchers.delete(key); continue; }
+    try { await checkOneSale(chatId,mint,user); } catch {}
+  }
+}
+
+async function checkOneSale(chatId,mint,user) {
+  const wallet=activeWallet(user); if (!wallet) return;
+  const tokenIds=mint._mintedTokenIds||(mint._lastMintedTokenId?[mint._lastMintedTokenId]:[]);
+  if (!tokenIds.length) return;
+  for (const tokenId of tokenIds) {
+    const saleKey=`_saleFired_${tokenId}`; if (mint[saleKey]) continue;
+    const sold=await detectSaleOpenSea(mint,tokenId,wallet.address)||await detectSaleOnChain(mint,tokenId,wallet.address);
+    if (!sold) continue;
+    mint[saleKey]=true; saveDb();
+    if (sold.salePriceEth>0) await collectProfitFee(chatId,mint,sold.salePriceEth);
+  }
+  const allDone=tokenIds.every(id=>mint[`_saleFired_${id}`]);
+  if (allDone&&tokenIds.length) { mint._saleClosed=true; stopSaleWatcher(chatId,mint.id); stopTopOfferWatcher(chatId,mint.id); saveDb(); }
+}
+
+async function detectSaleOpenSea(mint,tokenId,ownerAddress) {
+  if (!process.env.OPENSEA_API_KEY) return null;
+  try {
+    const chain=mint.chainId===8453?"base":"ethereum";
+    const data=await fetchJson(`https://api.opensea.io/api/v2/events/chain/${chain}/contract/${mint.contractAddress}/nfts/${tokenId}?event_type=sale&limit=5`,osHeaders());
+    for (const ev of (data.asset_events||data.events||[])) {
+      const t=ev.event_timestamp||ev.created_date;
+      if (t&&new Date(t).getTime()<(mint.confirmedAt||0)) continue;
+      const seller=(ev.seller||ev.from_address||"").toLowerCase();
+      if (seller!==ownerAddress.toLowerCase()) continue;
+      const wei=ev.payment?.quantity||ev.total_price; if (!wei) continue;
+      const price=parseFloat(ethers.formatEther(BigInt(wei)));
+      if (price>0) return {salePriceEth:price};
     }
-
-    if (type === "bytes32[]" || type === "bytes[]") {
-      if (Array.isArray(mint.merkleProof)) {
-        args.push(mint.merkleProof);
-        continue;
-      }
-      return null;
-    }
-
-    if (type === "bytes32" || type === "bytes") {
-      if (mint.proof) {
-        args.push(mint.proof);
-        continue;
-      }
-      return null;
-    }
-
-    if (type === "bool") {
-      args.push(true);
-      continue;
-    }
-
     return null;
-  }
-
-  return args;
+  } catch { return null; }
 }
 
-function resolveMintValue(mint) {
-  if (mint.totalValueEth) {
-    return ethers.parseEther(String(mint.totalValueEth));
-  }
-
-  if (!mint.priceEth) {
-    return 0n;
-  }
-
-  const unitPrice = ethers.parseEther(String(mint.priceEth));
-  return unitPrice * BigInt(mint.quantity || 1);
-}
-
-async function buildFeeOverrides(chainId, options = {}) {
-  const provider = getProvider(chainId);
-  const feeData = await provider.getFeeData();
-  const boostPercent = gasBoostPercent(options);
-
-  if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
-    return {
-      maxFeePerGas: boostWei(feeData.maxFeePerGas, boostPercent),
-      maxPriorityFeePerGas: boostWei(feeData.maxPriorityFeePerGas, boostPercent)
-    };
-  }
-
-  if (feeData.gasPrice) {
-    return { gasPrice: boostWei(feeData.gasPrice, boostPercent) };
-  }
-
-  return {};
-}
-
-async function resolveGasLimit(contract, candidate, value) {
-  const overrides = { value };
-  const fn = contract[candidate.functionKey];
-
+async function detectSaleOnChain(mint,tokenId,ownerAddress) {
   try {
-    const estimated = await fn.estimateGas(...candidate.args, overrides);
-    return (estimated * 130n) / 100n;
-  } catch (err) {
-    return DEFAULT_GAS_LIMIT;
+    const provider=getProvider(mint.chainId); const c=new ethers.Contract(mint.contractAddress,ERC721_ABI,provider.getActive());
+    const block=await provider.getBlock("latest"); const from=Math.max(0,(block?.number||0)-5000);
+    const logs=await c.queryFilter(c.filters.Transfer(ownerAddress,null,BigInt(tokenId)),from);
+    if (!logs.length) return null;
+    const log=logs[logs.length-1]; const to=log.args?.to||"";
+    if (to.toLowerCase()===ownerAddress.toLowerCase()||to===ethers.ZeroAddress) return null;
+    const tx=await provider.getActive().getTransaction(log.transactionHash);
+    return {salePriceEth:tx?.value?parseFloat(ethers.formatEther(tx.value)):0};
+  } catch { return null; }
+}
+
+// ─── LISTING ─────────────────────────────────────────────────────────────────
+async function doListing(chatId,mint,priceEth) {
+  if (!process.env.OPENSEA_API_KEY) { await send(chatId,"OpenSea listing needs OPENSEA_API_KEY in .env."); return; }
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  if (!wallet) { await send(chatId,"No active wallet."); return; }
+  if (!mint.contractAddress) { await send(chatId,"No contract address on this mint."); return; }
+  const chain=mint.chainId===8453?"base":"ethereum";
+  const priceWei=ethers.parseEther(String(priceEth));
+  await send(chatId,`Listing ${mint.mintName} at ${priceEth} ETH...`);
+  try {
+    const provider=getProvider(mint.chainId);
+    const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    let tokenId=mint._lastMintedTokenId||await fetchFirstToken(signer.address,mint.contractAddress,mint.chainId);
+    if (!tokenId) { await send(chatId,`No token found for ${mint.mintName} in this wallet.`); return; }
+    const expiry=Math.floor(Date.now()/1000)+60*60*24*30;
+    const orderParams={
+      offerer:signer.address, zone:ethers.ZeroAddress,
+      offer:[{itemType:2,token:mint.contractAddress,identifierOrCriteria:tokenId,startAmount:"1",endAmount:"1"}],
+      consideration:[{itemType:0,token:ethers.ZeroAddress,identifierOrCriteria:"0",startAmount:priceWei.toString(),endAmount:priceWei.toString(),recipient:signer.address}],
+      orderType:0, startTime:Math.floor(Date.now()/1000).toString(), endTime:expiry.toString(),
+      zoneHash:"0x0000000000000000000000000000000000000000000000000000000000000000",
+      salt:ethers.hexlify(ethers.randomBytes(16)),
+      conduitKey:"0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+      counter:"0"
+    };
+    const domain={name:"Seaport",version:"1.6",chainId:mint.chainId,verifyingContract:"0x0000000000000068f116a894984e2db1123eb395"};
+    const types={
+      OrderComponents:[
+        {name:"offerer",type:"address"},{name:"zone",type:"address"},
+        {name:"offer",type:"OfferItem[]"},{name:"consideration",type:"ConsiderationItem[]"},
+        {name:"orderType",type:"uint8"},{name:"startTime",type:"uint256"},
+        {name:"endTime",type:"uint256"},{name:"zoneHash",type:"bytes32"},
+        {name:"salt",type:"uint256"},{name:"conduitKey",type:"bytes32"},{name:"counter",type:"uint256"}
+      ],
+      OfferItem:[{name:"itemType",type:"uint8"},{name:"token",type:"address"},{name:"identifierOrCriteria",type:"uint256"},{name:"startAmount",type:"uint256"},{name:"endAmount",type:"uint256"}],
+      ConsiderationItem:[{name:"itemType",type:"uint8"},{name:"token",type:"address"},{name:"identifierOrCriteria",type:"uint256"},{name:"startAmount",type:"uint256"},{name:"endAmount",type:"uint256"},{name:"recipient",type:"address"}]
+    };
+    const sig=await signer.signTypedData(domain,types,orderParams);
+    const res=await fetch(`https://api.opensea.io/api/v2/orders/${chain}/seaport/listings`,{method:"POST",headers:{"Content-Type":"application/json","x-api-key":process.env.OPENSEA_API_KEY},body:JSON.stringify({parameters:orderParams,signature:sig,protocol_address:"0x0000000000000068f116a894984e2db1123eb395"})});
+    if (!res.ok) { await send(chatId,[`Listing failed (OpenSea API error).`,`List manually: https://opensea.io/assets/${chain}/${mint.contractAddress}/${tokenId}`,`Price: ${priceEth} ETH`].join("\n")); return; }
+    await send(chatId,[`Listed. ${mint.mintName} #${tokenId}`,`Price: ${priceEth} ETH`,``,`https://opensea.io/assets/${chain}/${mint.contractAddress}/${tokenId}`].join("\n"));
+  } catch(err) {
+    await send(chatId,[`Listing failed: ${shortErr(err)}`,`List manually: https://opensea.io/assets/${chain}/${mint.contractAddress}/${mint._lastMintedTokenId||""}`].join("\n"));
   }
 }
 
-async function estimateGasCap(chatId, user, mint) {
-  const provider = getProvider(mint.chainId);
-  const walletRecord = getActiveWallet(user);
-  const value = resolveMintValue(mint);
-  let gasLimit = DEFAULT_GAS_LIMIT;
-  let note = "";
+async function fetchFirstToken(owner,contract,chainId) {
+  try {
+    const provider=getProvider(chainId); const c=new ethers.Contract(contract,ERC721_ABI,provider.getActive());
+    const bal=await c.balanceOf(owner); if (!bal||bal===0n) return null;
+    try { return (await c.tokenOfOwnerByIndex(owner,0)).toString(); } catch {}
+    const block=await provider.getBlock("latest"); const from=Math.max(0,(block?.number||0)-2000);
+    const logs=await c.queryFilter(c.filters.Transfer(null,owner),from);
+    if (logs.length) return logs[logs.length-1].args.tokenId.toString();
+    return null;
+  } catch { return null; }
+}
 
-  if (walletRecord && walletRecord.encryptedPrivateKey && mint.contractAddress) {
+// ─── FEE SYSTEM ──────────────────────────────────────────────────────────────
+async function collectProfitFee(chatId,mint,salePriceEth) {
+  if (!TREASURY||!ethers.isAddress(TREASURY)) return;
+  const mintPrice=parseFloat(mint.priceEth||0);
+  if (!mintPrice||salePriceEth<=mintPrice) return;
+  const profit=salePriceEth-mintPrice;
+  const fee=profit*FEE_BPS/10000;
+  if (fee<=0) return;
+  const user=getUser(chatId); const wallet=activeWallet(user); if (!wallet) return;
+  lbAdd(chatId,"totalProfit",profit);
+  const prev=user.leaderboard?.bestSingleMint||0;
+  if (profit>prev) { user.leaderboard=user.leaderboard||{}; user.leaderboard.bestSingleMint=profit; }
+  const isBase=mint.chainId===8453;
+  if (isBase) {
+    // Silent collection on Base — just notify the sale result
     try {
-      const privateKey = decryptPrivateKey(walletRecord.encryptedPrivateKey);
-      const wallet = new ethers.Wallet(privateKey, provider);
-      const abi = await resolveContractAbi(mint);
-      const contract = new ethers.Contract(mint.contractAddress, abi, wallet);
-      const candidate = selectMintFunction(contract.interface, mint, wallet.address);
-      if (candidate) {
-        gasLimit = await resolveGasLimit(contract, candidate, value);
-      }
-    } catch (err) {
-      note = "Using a safe default because live estimation is unavailable.";
-    }
+      const provider=getProvider(mint.chainId);
+      const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+      const feeWei=ethers.parseUnits(profit.toFixed(18),"ether")*BigInt(FEE_BPS)/10000n;
+      const tx=await signer.sendTransaction({to:TREASURY,value:feeWei});
+      await tx.wait(1);
+    } catch(err) { console.error("Fee collection failed:",err.message); }
+    // Notify sale result only — no fee mention
+    await send(chatId,[
+      `${mint.mintName} sold — ${salePriceEth} ETH`,
+      `Profit: +${profit.toFixed(4)} ETH`
+    ].join("\n"));
   } else {
-    note = "Used a default gas estimate because no live wallet is connected.";
+    // Ethereum — store pending, notify sale result + one-line bundle note
+    user.pendingFee=user.pendingFee||{};
+    user.pendingFee[mint.id]={feeEth:fee,mintName:mint.mintName,salePriceEth,mintPriceEth:mintPrice,profitEth:profit,at:Date.now()};
+    await send(chatId,[
+      `${mint.mintName} sold — ${salePriceEth} ETH`,
+      `Profit: +${profit.toFixed(4)} ETH`,
+      `Platform fee bundles into your next mint to save gas.`
+    ].join("\n"));
   }
-
-  const feeOverrides = await buildFeeOverrides(mint.chainId, {
-    riskMode: riskModeForMint(user, mint).key,
-    gasWarMode: Boolean(mint.gasWarMode || user.gasWarMode),
-    attempt: 1
-  });
-  const maxFee = feeOverrides.maxFeePerGas || feeOverrides.gasPrice || ethers.parseUnits("30", "gwei");
-  const estimatedMaxGas = gasLimit * maxFee;
-  const gasCap = (estimatedMaxGas * gasCapMultiplierPercent(user, mint)) / 100n;
-  const mintValue = value;
-  const totalCost = mintValue + gasCap;
-  const gasPercent = totalCost > 0n
-    ? `${Number((gasCap * 10000n) / totalCost) / 100}%`
-    : "100%";
-
-  return {
-    gasCapEth: trimEth(ethers.formatEther(gasCap)),
-    gasPercent,
-    note
-  };
+  saveDb();
 }
 
-function gasBoostPercent(options = {}) {
-  const riskMode = RISK_MODES[normalizeRiskMode(options.riskMode)] || RISK_MODES.fast;
-  const attempt = BigInt(Math.max(0, Number(options.attempt || 1) - 1));
-  const baseBoost = riskMode.gasBoostPercent || GAS_BOOST_PERCENT;
-  return baseBoost + (options.gasWarMode ? GAS_WAR_STEP_PERCENT * attempt : 0n);
+async function collectPendingFee(chatId,user,value,signer,chainId) {
+  if (chainId===8453) return 0n;
+  const pending=user.pendingFee||{}; const keys=Object.keys(pending);
+  if (!keys.length) return 0n;
+  // Snapshot before clearing so we can restore on failure
+  const snapshot={}; let total=0n;
+  for (const k of keys) {
+    snapshot[k]=pending[k];
+    // Convert safely via parseUnits to avoid float precision issues
+    const feeWei=ethers.parseUnits(pending[k].feeEth.toFixed(18),"ether")*BigInt(FEE_BPS)/10000n;
+    total+=feeWei;
+    delete pending[k];
+  }
+  user.pendingFee={};
+  if (total>0n&&TREASURY&&ethers.isAddress(TREASURY)) {
+    try {
+      const tx=await signer.sendTransaction({to:TREASURY,value:total});
+      await tx.wait(1);
+    } catch(err) {
+      // Restore snapshot on failure — use snapshot not the cleared pending object
+      for (const k of keys) user.pendingFee[k]=snapshot[k];
+      console.error("Pending fee failed:",err.message);
+      return 0n;
+    }
+  }
+  return total;
 }
 
-function boostWei(value, boostPercent = GAS_BOOST_PERCENT) {
-  return (BigInt(value) * BigInt(boostPercent)) / 100n;
-}
-
+// ─── STATUS / GAS / HISTORY / LEADERBOARD ────────────────────────────────────
 async function sendStatus(chatId) {
-  const user = getUser(chatId);
-  const mints = (user.mints || []).filter((mint) => mint.confirmed && !mint.completedAt);
-  const wallet = getActiveWallet(user);
-
+  const user=getUser(chatId); const wallet=activeWallet(user);
+  const mints=(user.mints||[]).filter(m=>m.confirmed&&!m.completedAt);
+  const bal=wallet?await quickBalance(wallet):null;
   if (!mints.length) {
-    await safeSend(
-      chatId,
-      wallet ? `No live mints right now.\nLive wallet: ${shortAddress(wallet.address)}` : "No live mints right now, and no wallet is set.",
-      MAIN_MENU_KEYBOARD
-    );
-    return;
+    await send(chatId,[wallet?`${shortAddr(wallet.address)}  ${bal}`:"No wallet set.","","Nothing armed. Track a drop to get started."].join("\n"),
+      {reply_markup:{inline_keyboard:[[{text:"📊 Track a Drop",callback_data:"track:start"}]]},...KEYBOARD}); return;
   }
-
-  const lines = [
-    "Live Status",
-    wallet ? `Wallet: ${shortAddress(wallet.address)}` : "Wallet: not set",
-    ""
-  ];
-  const buttons = [];
-
+  const lines=[wallet?`${shortAddr(wallet.address)}  ${bal}`:"No wallet",""]; const buttons=[];
   for (const mint of mints) {
-    const auto = mint.autoMint || {};
-    lines.push(
-      `${mint.mintName} (${mint.userTier.toUpperCase()})`,
-      `Buy time: ${formatDateTime(mint.mintTime)}`,
-      `Countdown: ${formatDuration(mint.mintTime - Date.now())}`,
-      `Network: ${mint.chainName || "unknown"}`,
-      `Mint page: ${mint.contractAddress ? "ready" : "not ready"}`,
-      `Reminders: ${REMINDERS.map((item) => `${item.label}:${mint.firedReminders.includes(item.key) ? "sent" : "waiting"}`).join(" ")}`,
-      `Auto-buy: ${mint.autoMintEnabled ? "on" : "off"} | tries ${auto.attempts || 0}/${AUTO_MINT_MAX_ATTEMPTS} | ${auto.success ? "done" : "waiting"}`,
-      auto.lastError ? "Last issue: the buy did not go through." : "",
-      ""
-    );
-    buttons.push([
-      { text: `Buy Now - ${mint.mintName}`.slice(0, 60), callback_data: `status_instant:${mint.id}` }
-    ]);
-    buttons.push([
-      { text: `Stop Tracking - ${mint.mintName}`.slice(0, 60), callback_data: `mint_cancel:${mint.id}` }
-    ]);
+    const am=mint.autoMint||{};
+    lines.push(`${mint.mintName} (${mint.userTier.toUpperCase()})`,`Opens: ${formatDt(mint.mintTime)}  (${formatDur(mint.mintTime-Date.now())})`,`Auto: ${mint.autoMintEnabled?"on":"off"} · War: ${mint.gasWarMode?"on":"off"} · Flashbots: ${mint.flashbotsEnabled?"on":"off"}`,am.attempts?`Attempts: ${am.attempts}/${MAX_ATTEMPTS}`:null,am.lastError?`Last error: ${am.lastError.slice(0,80)}`:null,"");
+    buttons.push([{text:`⚡ Instant Mint — ${mint.mintName.slice(0,18)}`,callback_data:`instant_mint:${mint.id}`},{text:"❌ Cancel",callback_data:`cancel_mint:${mint.id}`}]);
   }
-
-  await safeSend(chatId, lines.filter(Boolean).join("\n"), {
-    reply_markup: { inline_keyboard: buttons }
-  });
+  await send(chatId,lines.filter(l=>l!==null).join("\n"),{reply_markup:{inline_keyboard:buttons}});
 }
 
-async function instantMintExisting(chatId, mintId) {
-  const user = getUser(chatId);
-  const mint = (user.mints || []).find((item) => item.id === mintId);
-
-  if (!mint) {
-    await safeSend(chatId, "I couldn't find that mint anymore.");
-    return;
+async function sendGas(chatId,opts={}) {
+  const chains=[...providers.entries()].map(([id,p])=>({id,p,cfg:Object.values(CHAIN).find(c=>c.chainId===id)}));
+  if (!chains.length) { await send(chatId,"No RPC URLs configured. Add ETHEREUM_RPC_URL or BASE_RPC_URL to .env."); return; }
+  const user=getUser(chatId); const lines=["Gas"];
+  for (const {id,p,cfg} of chains) {
+    try {
+      const [block,fee]=await Promise.all([p.getBlock("latest"),p.getFeeData()]);
+      lines.push("",cfg?.chainName||`Chain ${id}`,block?.baseFeePerGas?`Base fee:   ${fmtGwei(block.baseFeePerGas)} gwei`:null,fee.gasPrice?`Gas price:  ${fmtGwei(fee.gasPrice)} gwei`:null,fee.maxFeePerGas?`Max fee:    ${fmtGwei(fee.maxFeePerGas)} gwei`:null,fee.maxPriorityFeePerGas?`Priority:   ${fmtGwei(fee.maxPriorityFeePerGas)} gwei`:null);
+    } catch { lines.push("",cfg?.chainName||`Chain ${id}`,"RPC unavailable"); }
   }
-
-  mint.mintTime = Date.now() - AUTO_MINT_DELAY_MS;
-  mint.autoMintEnabled = true;
-  mint.autoMint = mint.autoMint || {};
-  mint.autoMint.success = false;
-  mint.autoMint.inFlight = false;
-  mint.updatedAt = Date.now();
-  saveDb();
-  await safeSend(chatId, `Trying a buy right now for ${mint.mintName}.`);
-  await maybeAttemptAutoMint(chatId, mint.id, "manual_instant");
+  lines.push("",`Baseline boost: 10% always`,`Gas War: ${user.gasWarMode?"ON ⚔️ — escalates each retry":"off"}`);
+  const markup={reply_markup:{inline_keyboard:[[{text:"🔄 Refresh",callback_data:"gas:refresh"}],[{text:`⚔️ Gas War: ${user.gasWarMode?"ON — tap to turn off":"off — tap to turn on"}`,callback_data:"gas:toggle_war"}]]}};
+  if (opts.editId) await safeEdit(chatId,opts.editId,lines.filter(l=>l!==null).join("\n"),markup);
+  else await send(chatId,lines.filter(l=>l!==null).join("\n"),markup);
 }
 
-async function cancelConfirmedMint(chatId, mintId) {
-  const user = getUser(chatId);
-  const mint = (user.mints || []).find((item) => item.id === mintId);
-
-  if (!mint) {
-    await safeSend(chatId, "I couldn't find that mint anymore.");
-    return;
-  }
-
-  mint.completedAt = Date.now();
-  mint.cancelledAt = Date.now();
-  mint.updatedAt = Date.now();
-  clearAutoMintTimer(chatId, mint.id);
-  saveDb();
-  await safeSend(chatId, `Stopped tracking ${mint.mintName}.`, MAIN_MENU_KEYBOARD);
+async function sendHistory(chatId) {
+  const user=getUser(chatId); const history=user.mintHistory||[]; const pnl=getPnL(user);
+  const lines=["Mint History","",`Total mints:  ${pnl.totalMints}`,`ETH spent:    ${pnl.spent.toFixed(4)}`,`Profit:       +${pnl.returned.toFixed(4)} ETH`,`Net:          ${pnl.net>=0?"+":""}${pnl.net.toFixed(4)} ETH`,""];
+  if (!history.length) { lines.push("No mints yet. Track a drop to get started."); }
+  else { for (const h of history.slice(0,10)) { lines.push(`${h.mintName} (${(h.userTier||"").toUpperCase()})`,`Status: ${h.status}`,h.txHash?`Tx: ${h.txHash}`:null,`Time: ${formatDt(h.timestamp)}`,""); } }
+  await send(chatId,lines.filter(l=>l!==null).join("\n"),KEYBOARD);
 }
 
-async function sendMintHistory(chatId) {
-  const user = getUser(chatId);
-  const history = user.mintHistory || [];
-
-  if (!history.length) {
-    await safeSend(chatId, "No buys yet.", MAIN_MENU_KEYBOARD);
-    return;
-  }
-
-  const lines = ["Buy History", ""];
-  for (const item of history.slice(0, 10)) {
-    lines.push(
-      `${item.mintName} (${String(item.userTier || "").toUpperCase()})`,
-      `Result: ${item.status}`,
-      item.txHash ? "Receipt: open it from the buy alert" : "Receipt: not available",
-      `Time: ${formatDateTime(item.timestamp)}`,
-      ""
-    );
-  }
-
-  await safeSend(chatId, lines.join("\n"), MAIN_MENU_KEYBOARD);
-}
-
-async function sendAutoMintPanel(chatId) {
-  const user = getUser(chatId);
-  const mints = (user.mints || []).filter((mint) => mint.confirmed && !mint.completedAt);
-
-  if (!mints.length) {
-    await safeSend(chatId, "No live mints right now.", MAIN_MENU_KEYBOARD);
-    return;
-  }
-
-  const lines = ["Auto-Buy", "This is where the bot handles the timing for you.", ""];
-  const buttons = [];
-
-  for (const mint of mints) {
-    const auto = mint.autoMint || {};
-    lines.push(
-      `${mint.mintName} (${mint.userTier.toUpperCase()})`,
-      `Mode: ${mint.autoMintEnabled ? "on" : "off"} | tries ${auto.attempts || 0}/${AUTO_MINT_MAX_ATTEMPTS}`,
-      `Buy time: ${formatDateTime(mint.mintTime)}`,
-      ""
-    );
-    buttons.push([{
-      text: `${mint.autoMintEnabled ? "Turn Off" : "Turn On"} Auto-Buy - ${mint.mintName}`.slice(0, 60),
-      callback_data: `mint_toggle:auto:${mint.id}`
-    }]);
-  }
-
-  await safeSend(chatId, lines.join("\n"), {
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
-
-async function sendRemindersPanel(chatId) {
-  const user = getUser(chatId);
-  const mints = (user.mints || []).filter((mint) => mint.confirmed && !mint.completedAt);
-
-  if (!mints.length) {
-    await safeSend(chatId, "No live mints right now.", MAIN_MENU_KEYBOARD);
-    return;
-  }
-
-  const lines = ["Reminders", "This is where the bot keeps you early, not late.", ""];
-  const buttons = [];
-
-  for (const mint of mints) {
-    lines.push(
-      `${mint.mintName} (${mint.userTier.toUpperCase()})`,
-      `Mode: ${mint.remindersEnabled ? "on" : "off"}`,
-      `Sent: ${mint.firedReminders.length}/${REMINDERS.length}`,
-      ""
-    );
-    buttons.push([{
-      text: `${mint.remindersEnabled ? "Turn Off" : "Turn On"} Reminders - ${mint.mintName}`.slice(0, 60),
-      callback_data: `mint_toggle:reminders:${mint.id}`
-    }]);
-  }
-
-  await safeSend(chatId, lines.join("\n"), {
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
-
-async function toggleConfirmedMintSetting(chatId, field, mintId) {
-  const user = getUser(chatId);
-  const mint = (user.mints || []).find((item) => item.id === mintId);
-
-  if (!mint) {
-    await safeSend(chatId, "I couldn't find that mint anymore.");
-    return;
-  }
-
-  if (field === "auto") {
-    mint.autoMintEnabled = !mint.autoMintEnabled;
-    if (mint.autoMintEnabled) {
-      scheduleAutoMint(chatId, mint);
-    } else {
-      clearAutoMintTimer(chatId, mint.id);
-    }
-  } else if (field === "reminders") {
-    mint.remindersEnabled = !mint.remindersEnabled;
-  } else if (field === "flashbots") {
-    mint.flashbotsEnabled = !mint.flashbotsEnabled;
-  } else if (field === "gaswar") {
-    mint.gasWarMode = !mint.gasWarMode;
-  } else {
-    await safeSend(chatId, "I couldn't change that setting.");
-    return;
-  }
-
-  mint.updatedAt = Date.now();
-  saveDb();
-
-  if (field === "auto") {
-    await sendAutoMintPanel(chatId);
-  } else {
-    await sendRemindersPanel(chatId);
-  }
-}
-
-async function sendGas(chatId, options = {}) {
-  const chains = configuredChains();
-  const user = getUser(chatId);
-  const riskMode = riskModeForUser(user);
-  if (!chains.length) {
-    await safeSend(chatId, "Gas is down right now.");
-    return;
-  }
-
-  try {
-    const lines = ["Gas", "Use this to decide how aggressive you want the bot to be.", ""];
-
-    for (const chain of chains) {
-      const provider = getProvider(chain.chainId);
-      const [block, feeData] = await Promise.all([
-        provider.getBlock("latest"),
-        provider.getFeeData()
-      ]);
-
-      lines.push(
-        `${chain.chainName}`,
-        block && block.baseFeePerGas ? `Base fee: ${formatGwei(block.baseFeePerGas)} gwei` : "Base fee: n/a",
-        feeData.gasPrice ? `Gas price: ${formatGwei(feeData.gasPrice)} gwei` : "",
-        feeData.maxPriorityFeePerGas ? `Priority: ${formatGwei(feeData.maxPriorityFeePerGas)} gwei` : "",
-        feeData.maxFeePerGas ? `Max fee: ${formatGwei(feeData.maxFeePerGas)} gwei` : "",
-        ""
-      );
-    }
-
-    lines.push(`Mode: ${riskMode.label}`);
-    lines.push(`Auto-buy push: ${riskMode.gasBoostPercent.toString()}%`);
-    lines.push(`Gas War: ${user.gasWarMode ? "on" : "off"}`);
-
-    const markup = {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "Refresh", callback_data: "gas:refresh" },
-            { text: `Gas War: ${user.gasWarMode ? "On" : "Off"}`, callback_data: "gaswar:toggle" }
-          ],
-          [
-            { text: "Safe", callback_data: "riskmode:set:safe" },
-            { text: "Fast", callback_data: "riskmode:set:fast" },
-            { text: "Degenerate", callback_data: "riskmode:set:degenerate" }
-          ]
-        ]
-      }
-    };
-
-    if (options.editMessageId) {
-      await safeEdit(chatId, options.editMessageId, lines.join("\n"), markup);
-    } else {
-      await safeSend(chatId, lines.join("\n"), markup);
-    }
-  } catch (err) {
-    await safeSend(chatId, "Gas is down right now. Try again in a moment.");
-  }
-}
-
+// ─── TRENDING ────────────────────────────────────────────────────────────────
 async function sendTrending(chatId) {
-  if (!process.env.OPENSEA_API_KEY) {
-    await safeSend(chatId, "Trending is down right now.");
-    return;
-  }
-
+  if (!process.env.OPENSEA_API_KEY) { await send(chatId,"Trending needs OPENSEA_API_KEY in .env."); return; }
   try {
-    const lines = ["Trending Collections", ""];
-    const buttons = [];
-
-    for (const chain of Object.values(CHAIN_CONFIGS)) {
-      const url = new URL("https://api.opensea.io/api/v2/collections");
-      url.searchParams.set("chain", chain.openSeaChain);
-      url.searchParams.set("limit", "3");
-      const data = await fetchJson(url.toString(), openSeaHeaders());
-      const collections = data.collections || [];
-
-      if (collections.length) {
-        lines.push(chain.chainName);
+    const lines=["🔥 Trending Now",""]; const buttons=[];
+    for (const cfg of Object.values(CHAIN)) {
+      const url=new URL("https://api.opensea.io/api/v2/collections");
+      url.searchParams.set("chain",cfg.openSeaChain); url.searchParams.set("limit","4");
+      const data=await fetchJson(url.toString(),osHeaders());
+      const collections=data.collections||[];
+      if (!collections.length) continue;
+      lines.push(cfg.chainName);
+      for (const col of collections.slice(0,4)) {
+        const slug=col.collection||col.slug||col.collection_slug;
+        const name=col.name||slug||"Unknown";
+        const floor=col.stats?.floor_price||col.floor_price;
+        const floorStr=floor?`  ${parseFloat(floor).toFixed(4)} ETH`:"";
+        lines.push(`${name}${floorStr}`);
+        if (slug) buttons.push([{text:`Track: ${name}`.slice(0,60),callback_data:`track_slug:${slug}`}]);
       }
-
-      for (const collection of collections.slice(0, 3)) {
-        const slug = collection.collection || collection.slug || collection.collection_slug;
-        const name = collection.name || slug || "Unknown";
-        lines.push(`${name}${slug ? ` (${slug})` : ""}`);
-        if (slug) buttons.push([{ text: `Track ${name}`.slice(0, 60), callback_data: `track_collection:${slug}` }]);
-      }
-
-      if (collections.length) {
-        lines.push("");
-      }
+      lines.push("");
     }
-
-    if (!buttons.length) {
-      await safeSend(chatId, "No trending collections returned.");
-      return;
-    }
-
-    await safeSend(chatId, lines.join("\n"), {
-      reply_markup: { inline_keyboard: buttons }
-    });
-  } catch (err) {
-    await safeSend(chatId, "Trending is down right now. Try again in a moment.");
-  }
-}
-
-async function sendPortfolio(chatId) {
-  const user = getUser(chatId);
-  const wallet = getActiveWallet(user);
-
-  if (!wallet) {
-    await safeSend(chatId, "Set or create a wallet first.", MAIN_MENU_KEYBOARD);
-    return;
-  }
-
-  if (!process.env.OPENSEA_API_KEY) {
-    await safeSend(chatId, "Portfolio is down right now.");
-    return;
-  }
-
-  try {
-    const allNfts = [];
-    for (const chain of Object.values(CHAIN_CONFIGS)) {
-      const url = `https://api.opensea.io/api/v2/chain/${chain.openSeaChain}/account/${wallet.address}/nfts?limit=5`;
-      const data = await fetchJson(url, openSeaHeaders()).catch(() => ({ nfts: [] }));
-      for (const nft of data.nfts || []) {
-        allNfts.push({ ...nft, chainName: chain.chainName });
-      }
-    }
-
-    if (!allNfts.length) {
-      await safeSend(chatId, `No NFTs found for ${shortAddress(wallet.address)} right now.`);
-      return;
-    }
-
-    const lines = [`Portfolio - ${shortAddress(wallet.address)}`, ""];
-    for (const nft of allNfts.slice(0, 10)) {
-      lines.push(`${nft.name || nft.identifier || "Unnamed NFT"} - ${nft.collection || ""} (${nft.chainName})`.trim());
-    }
-    await safeSend(chatId, lines.join("\n"), MAIN_MENU_KEYBOARD);
-  } catch (err) {
-    await safeSend(chatId, "Portfolio is down right now. Try again in a moment.");
-  }
-}
-
-async function fetchWalletNfts(address, limit = 10) {
-  if (!process.env.OPENSEA_API_KEY) return [];
-
-  const allNfts = [];
-  for (const chain of Object.values(CHAIN_CONFIGS)) {
-    const url = `https://api.opensea.io/api/v2/chain/${chain.openSeaChain}/account/${address}/nfts?limit=${limit}`;
-    const data = await fetchJson(url, openSeaHeaders()).catch(() => ({ nfts: [] }));
-    for (const nft of data.nfts || []) {
-      const contractAddress = nft.contract || nft.contract_address || nft.asset_contract_address;
-      const tokenId = nft.identifier || nft.token_id || nft.tokenId;
-      if (!contractAddress || !tokenId || !ethers.isAddress(contractAddress)) continue;
-      allNfts.push({
-        name: nft.name || nft.identifier || "NFT",
-        contractAddress: ethers.getAddress(contractAddress),
-        tokenId: String(tokenId),
-        chainId: chain.chainId,
-        chainName: chain.chainName,
-        collection: nft.collection || nft.collection_slug || null
-      });
-    }
-  }
-  return allNfts.slice(0, limit);
-}
-
-async function fetchOpenSeaNftDetails(token) {
-  if (!process.env.OPENSEA_API_KEY) {
-    throw new Error("OpenSea is unavailable right now");
-  }
-
-  const chain = getChainConfig(token.chainId);
-  if (!chain) {
-    throw new Error("Unsupported network");
-  }
-
-  const url = `https://api.opensea.io/api/v2/chain/${chain.openSeaChain}/contract/${token.contractAddress}/nfts/${token.tokenId}`;
-  const data = await fetchJson(url, openSeaHeaders());
-  const nft = data.nft || data;
-  const collection = nft.collection || data.collection || {};
-  const rarity = nft.rarity || data.rarity || {};
-
-  return {
-    name: nft.name || data.name || `Token #${token.tokenId}`,
-    imageUrl: nft.image_url || nft.imageUrl || data.image_url || data.imageUrl || null,
-    assetUrl: nft.opensea_url || nft.openseaUrl || data.opensea_url || data.openseaUrl || openSeaAssetUrl(token.chainId, token.contractAddress, token.tokenId),
-    collectionName: collection.name || data.collection_name || token.mintName || null,
-    openSeaSlug: collection.collection || collection.slug || nft.collection_slug || token.openSeaSlug || null,
-    rarityRank: firstFiniteNumber(
-      rarity.rank,
-      rarity.rank_value,
-      rarity.ranking,
-      nft.rarity_rank,
-      data.rarity_rank
-    ),
-    rarityMaxRank: firstFiniteNumber(
-      rarity.max_rank,
-      rarity.maxRank,
-      collection.total_supply,
-      collection.totalSupply,
-      data.total_supply
-    ),
-    rarityScore: firstFiniteNumber(
-      rarity.score,
-      rarity.rarity_score,
-      nft.rarity_score,
-      data.rarity_score
-    )
-  };
-}
-
-async function createOpenSeaListing(user, token, priceEth) {
-  if (!process.env.OPENSEA_API_KEY) {
-    throw new Error("OpenSea listing is unavailable right now");
-  }
-
-  const walletRecord = findWalletForToken(user, token);
-  if (!walletRecord || !walletRecord.encryptedPrivateKey) {
-    throw new Error("No wallet is saved for this item");
-  }
-
-  let sdkModule;
-  try {
-    sdkModule = require("@opensea/sdk");
-  } catch (err) {
-    throw new Error("Listing support is not installed on this bot yet");
-  }
-
-  const provider = getProvider(token.chainId);
-  const signer = new ethers.Wallet(decryptPrivateKey(walletRecord.encryptedPrivateKey), provider);
-  const sdk = new sdkModule.OpenSeaSDK(
-    signer,
-    {
-      chain: openSeaSdkChain(token.chainId, sdkModule.Chain),
-      apiKey: process.env.OPENSEA_API_KEY
-    },
-    (arg) => console.log(arg)
-  );
-
-  const listing = await sdk.createListing({
-    asset: {
-      tokenAddress: token.contractAddress,
-      tokenId: String(token.tokenId)
-    },
-    accountAddress: signer.address,
-    amount: String(priceEth)
-  });
-
-  return {
-    orderHash: listing && (listing.order_hash || listing.orderHash || listing.hash) || null,
-    assetUrl: token.assetUrl || openSeaAssetUrl(token.chainId, token.contractAddress, token.tokenId),
-    marketplace: "OpenSea"
-  };
-}
-
-async function executeTokenTransfer(user, walletRecord, transfer) {
-  if (!walletRecord || !walletRecord.encryptedPrivateKey) {
-    throw new Error("Active wallet has no private key");
-  }
-
-  const provider = getProvider(transfer.chainId);
-  const wallet = new ethers.Wallet(decryptPrivateKey(walletRecord.encryptedPrivateKey), provider);
-  const token = new ethers.Contract(transfer.tokenAddress, ERC20_ABI, wallet);
-  const decimals = await token.decimals().catch(() => 18);
-  const amount = ethers.parseUnits(String(transfer.amount), Number(decimals));
-  const tx = await token.transfer(transfer.destination, amount);
-  return { hash: tx.hash, receipt: await tx.wait(1) };
-}
-
-async function executeNftTransfer(user, walletRecord, nft, destination) {
-  if (!walletRecord || !walletRecord.encryptedPrivateKey) {
-    throw new Error("Active wallet has no private key");
-  }
-  if (!nft || !nft.contractAddress || nft.tokenId == null) {
-    throw new Error("NFT details are missing");
-  }
-
-  const provider = getProvider(nft.chainId);
-  const wallet = new ethers.Wallet(decryptPrivateKey(walletRecord.encryptedPrivateKey), provider);
-  const token = new ethers.Contract(nft.contractAddress, ERC721_ABI, wallet);
-  const tx = await token.transferFrom(wallet.address, destination, BigInt(nft.tokenId));
-  return { hash: tx.hash, receipt: await tx.wait(1) };
-}
-
-async function fetchOpenSeaCollection(slug, preferredChainId = null) {
-  if (!process.env.OPENSEA_API_KEY) {
-    return { name: slug, slug };
-  }
-
-  const collectionUrl = `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}`;
-  const statsUrl = `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`;
-  const [collection, stats] = await Promise.allSettled([
-    fetchJson(collectionUrl, openSeaHeaders()),
-    fetchJson(statsUrl, openSeaHeaders())
-  ]);
-
-  const collectionData = collection.status === "fulfilled" ? collection.value : {};
-  const statsData = stats.status === "fulfilled" ? stats.value : {};
-  const contracts = collectionData.contracts || collectionData.primary_asset_contracts || [];
-  const selectedContract = selectOpenSeaContract(contracts, preferredChainId);
-  const contractAddress = selectedContract && (selectedContract.address || selectedContract);
-  const chain = selectedContract && selectedContract.chainId
-    ? getChainConfig(selectedContract.chainId)
-    : getChainConfig(preferredChainId);
-
-  return {
-    slug,
-    name: collectionData.name || collectionData.collection || slug,
-    description: collectionData.description || null,
-    imageUrl: collectionData.image_url || collectionData.imageUrl || null,
-    contractAddress: contractAddress && ethers.isAddress(contractAddress) ? ethers.getAddress(contractAddress) : null,
-    chainId: chain ? chain.chainId : null,
-    chainName: chain ? chain.chainName : null,
-    stats: statsData
-  };
-}
-
-function selectOpenSeaContract(contracts, preferredChainId = null) {
-  const normalized = (contracts || []).map((contract) => {
-    const address = typeof contract === "string" ? contract : contract.address;
-    const chainId = typeof contract === "object"
-      ? normalizeOpenSeaChain(contract.chain || contract.blockchain || contract.network)
-      : null;
-    return { address, chainId };
-  }).filter((contract) => contract.address && ethers.isAddress(contract.address));
-
-  if (!normalized.length) return null;
-
-  const preferred = getChainConfig(preferredChainId);
-  if (preferred) {
-    const match = normalized.find((contract) => contract.chainId === preferred.chainId);
-    if (match) return match;
-  }
-
-  return normalized.find((contract) => getChainConfig(contract.chainId)) || normalized[0];
-}
-
-function parseOpenSeaInput(text) {
-  try {
-    const url = new URL(text);
-    if (!/opensea\.io$/i.test(url.hostname.replace(/^www\./, ""))) return {};
-    const parts = url.pathname.split("/").filter(Boolean);
-    const chainId = parts.map(normalizeOpenSeaChain).find(Boolean) || null;
-    const output = { isOpenSea: true, path: url.pathname, chainId };
-
-    if (parts[0] === "collection" && parts[1]) {
-      return { ...output, slug: parts[1] };
-    }
-
-    if (parts[0] === "drop" && parts[1]) {
-      return { ...output, slug: parts[1], dropSlug: parts[1] };
-    }
-
-    if (parts[0] === "mint" && parts[1]) {
-      const contractAddress = parts.find((part) => ethers.isAddress(part));
-      const slug = chainId && parts[2] ? parts[2] : parts[1];
-      return contractAddress
-        ? { ...output, contractAddress: ethers.getAddress(contractAddress) }
-        : { ...output, slug, dropSlug: slug };
-    }
-
-    if (parts[0] === "assets" && parts.length >= 3) {
-      const contractAddress = parts.find((part) => ethers.isAddress(part));
-      return { ...output, contractAddress: contractAddress ? ethers.getAddress(contractAddress) : null };
-    }
-
-    const contractAddress = parts.find((part) => ethers.isAddress(part));
-    return { ...output, contractAddress: contractAddress ? ethers.getAddress(contractAddress) : null };
-  } catch (err) {
-    return {};
-  }
-
-  return {};
-}
-
-function normalizeOpenSeaChain(value) {
-  if (!value) return null;
-  const normalized = String(value).toLowerCase();
-  return OPENSEA_CHAIN_TO_CHAIN_ID[normalized] || null;
-}
-
-function openSeaHeaders() {
-  return process.env.OPENSEA_API_KEY ? { "x-api-key": process.env.OPENSEA_API_KEY } : {};
-}
-
-async function fetchJson(url, headers = {}) {
-  const response = await fetch(url, { headers });
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`${response.status}: ${text.slice(0, 200)}`);
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    throw new Error(`Invalid JSON from ${url}`);
-  }
-}
-
-function looksLikeMintMessage(text) {
-  return /\b(mint|drop|wl|whitelist|allowlist|gtd|guaranteed|og|public|presale|contract|0x[a-fA-F0-9]{40})\b/i.test(text);
-}
-
-function getUser(chatId) {
-  const key = String(chatId);
-  db.users = db.users || {};
-  if (!db.users[key]) {
-    db.users[key] = {
-      wallets: [],
-      activeWalletId: null,
-      riskMode: "fast",
-      mints: [],
-      pendingMint: null,
-      mintHistory: [],
-      state: {},
-      history: [],
-      createdAt: Date.now()
-    };
-    saveDb();
-  }
-  return db.users[key];
-}
-
-function touchUser(chatId, from = null) {
-  const user = getUser(chatId);
-  user.telegramUserId = from && from.id ? String(from.id) : user.telegramUserId || String(chatId);
-  user.firstName = from && from.first_name ? from.first_name : user.firstName || "User";
-  user.username = from && from.username ? from.username : user.username || null;
-  user.lastActiveAt = Date.now();
-  saveDb();
-  return user;
-}
-
-function findMintById(user, mintId) {
-  if (!mintId) return null;
-  if (user.pendingMint && user.pendingMint.id === mintId) return user.pendingMint;
-  return (user.mints || []).find((item) => item.id === mintId) || null;
-}
-
-function nextLiveMint(user) {
-  return (user.mints || [])
-    .filter((mint) => mint.confirmed && !mint.completedAt)
-    .sort((a, b) => Number(a.mintTime || 0) - Number(b.mintTime || 0))[0] || null;
-}
-
-function findMintedToken(user, tokenRecordId) {
-  if (!user || !tokenRecordId) return null;
-  return (user.mintedTokens || []).find((item) => item.id === tokenRecordId) || null;
-}
-
-function findWalletForToken(user, token) {
-  if (!user) return null;
-  if (token && token.ownerWalletAddress) {
-    const match = (user.wallets || []).find((wallet) => (
-      String(wallet.address || "").toLowerCase() === String(token.ownerWalletAddress || "").toLowerCase()
-    ));
-    if (match) return match;
-  }
-  return getActiveWallet(user);
-}
-
-function hydrateMintedToken(token, details = {}) {
-  if (!token || !details) return token;
-  token.name = details.name || token.name || null;
-  token.imageUrl = details.imageUrl || token.imageUrl || null;
-  token.assetUrl = details.assetUrl || token.assetUrl || null;
-  token.collectionName = details.collectionName || token.collectionName || null;
-  token.openSeaSlug = details.openSeaSlug || token.openSeaSlug || null;
-  token.rarityRank = details.rarityRank || token.rarityRank || null;
-  token.rarityMaxRank = details.rarityMaxRank || token.rarityMaxRank || null;
-  token.rarityScore = details.rarityScore || token.rarityScore || null;
-  token.rarityCheckedAt = Date.now();
-  token.updatedAt = Date.now();
-  return token;
-}
-
-function displayMintedTokenName(token) {
-  if (!token) return "NFT";
-  return token.name || `${token.mintName || "NFT"} #${token.tokenId}`;
-}
-
-function rarityPositionLine(token) {
-  const rank = Number(token && token.rarityRank);
-  const maxRank = Number(token && token.rarityMaxRank);
-  if (!Number.isFinite(rank) || !Number.isFinite(maxRank) || maxRank <= 0) return "";
-  const topPercent = ((rank / maxRank) * 100);
-  return `Position: top ${topPercent.toFixed(topPercent < 10 ? 1 : 0)}%`;
-}
-
-function rarityRecommendationLine(token) {
-  const rank = Number(token && token.rarityRank);
-  const maxRank = Number(token && token.rarityMaxRank);
-  if (!Number.isFinite(rank) || !Number.isFinite(maxRank) || maxRank <= 0) {
-    return "Read: rarity is still loading. Check again in a moment.";
-  }
-
-  const ratio = rank / maxRank;
-  if (ratio <= 0.1) {
-    return "Read: this looks strong. Holding probably makes more sense than rushing a sale.";
-  }
-  if (ratio >= 0.5) {
-    return "Read: this looks like a weaker rank. Listing sooner probably makes more sense.";
-  }
-  return "Read: this is mid-pack. Wait for price action and decide from there.";
-}
-
-function logFeature(user, feature) {
-  if (!user || !feature) return;
-  user.featureUsage = user.featureUsage || {};
-  user.featureUsage[feature] = (user.featureUsage[feature] || 0) + 1;
-}
-
-function logUnhandled(chatId, type, rawInput) {
-  const user = getUser(chatId);
-  db.analytics = db.analytics || { unhandled: [] };
-  db.analytics.unhandled.push({
-    userId: String(chatId),
-    type,
-    rawInput: redactSensitive(String(rawInput || "")).slice(0, 500),
-    timestamp: Date.now()
-  });
-  db.analytics.unhandled = db.analytics.unhandled.slice(-1000);
-  user.updatedAt = Date.now();
-  saveDb();
+    if (!buttons.length) { await send(chatId,"Nothing returned from OpenSea right now. Try again in a moment."); return; }
+    await send(chatId,lines.join("\n"),{reply_markup:{inline_keyboard:[...buttons,[{text:"🔄 Refresh",callback_data:"trending"}]]}});
+  } catch(err) { await send(chatId,`Couldn't fetch trending: ${shortErr(err)}`); }
 }
 
 async function sendLeaderboard(chatId) {
-  const rows = Object.entries(db.users || {}).map(([id, user]) => {
-    const history = user.mintHistory || [];
-    const confirmed = history.filter((item) => item.status === "confirmed");
-    const totalEthSpent = confirmed.reduce((sum, item) => sum + Number(item.totalCostEth || item.valueEth || 0), 0);
-    const totalProfit = confirmed.reduce((sum, item) => sum + Number(item.profitEth || 0), 0);
-    const bestReturn = confirmed.reduce((max, item) => Math.max(max, Number(item.returnMultiple || 0)), 0);
-    return {
-      id,
-      user,
-      totalMints: confirmed.length,
-      totalEthSpent,
-      totalProfit,
-      bestReturn
-    };
-  }).filter((row) => row.totalMints > 0 || row.totalEthSpent > 0);
-
-  rows.sort((a, b) => (
-    b.totalMints - a.totalMints
-    || b.totalProfit - a.totalProfit
-    || b.bestReturn - a.bestReturn
-  ));
-
-  if (!rows.length) {
-    await safeSend(chatId, "Winners board is empty until the first buy lands.");
-    return;
+  const entries=[];
+  for (const [uid,user] of Object.entries(db.users||{})) {
+    const lb=user.leaderboard||{}; const profile=user.profile||{};
+    const name=profile.firstName||profile.username||`User ${uid.slice(-4)}`;
+    entries.push({name,telegramId:profile.telegramId||uid,totalMints:lb.totalMints||0,totalEthSpent:lb.totalEthSpent||0,totalProfit:lb.totalProfit||0,bestSingleMint:lb.bestSingleMint||0});
   }
-
-  const lines = ["Winners", ""];
-  for (const [index, row] of rows.slice(0, 20).entries()) {
-    lines.push(
-      `${index + 1}. ${telegramProfileLink(row.user)} - mints ${row.totalMints}, spent ${row.totalEthSpent.toFixed(4)} ETH, profit ${row.totalProfit.toFixed(4)} ETH, best ${row.bestReturn.toFixed(2)}x`
-    );
+  entries.sort((a,b)=>b.totalProfit-a.totalProfit||b.totalMints-a.totalMints);
+  if (!entries.length) { await send(chatId,"No leaderboard data yet. Mint something first."); return; }
+  const medals=["🥇","🥈","🥉"]; const lines=["🏆 Leaderboard",""];
+  for (const [i,e] of entries.slice(0,10).entries()) {
+    const medal=medals[i]||`${i+1}.`;
+    const nameLink=e.telegramId?`[${e.name}](tg://user?id=${e.telegramId})`:e.name;
+    lines.push(`${medal} ${nameLink}`,`${e.totalMints} mints · +${e.totalProfit.toFixed(4)} ETH profit · Best: ${e.bestSingleMint.toFixed(4)} ETH`,"");
   }
-
-  await safeSend(chatId, lines.join("\n"), { parse_mode: "HTML" });
+  await send(chatId,lines.join("\n"),{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔄 Refresh",callback_data:"leaderboard"}]]}});
 }
 
-async function sendAdminStats(msg) {
-  const chatId = msg.chat.id;
-  const senderId = msg.from && msg.from.id ? String(msg.from.id) : "";
-
-  if (!ADMIN_USER_ID || senderId !== ADMIN_USER_ID) {
-    await safeSend(chatId, "Stats are admin-only.");
-    return;
-  }
-
-  const users = Object.entries(db.users || {});
-  const now = Date.now();
-  const totalMints = users.reduce((sum, [, user]) => sum + (user.mintHistory || []).filter((item) => item.status === "confirmed").length, 0);
-  const active24h = users.filter(([, user]) => user.lastActiveAt && now - user.lastActiveAt <= 86400000).length;
-  const featureCounts = {};
-  for (const [, user] of users) {
-    for (const [feature, count] of Object.entries(user.featureUsage || {})) {
-      featureCounts[feature] = (featureCounts[feature] || 0) + count;
-    }
-  }
-  const unhandled = groupUnhandledInteractions();
-
-  const lines = [
-    "Admin Stats",
-    `Registered users: ${users.length}`,
-    `Active 24h: ${active24h}`,
-    `Total confirmed mints: ${totalMints}`,
-    `Total fees collected: ${db.totalFeesCollectedEth || 0} ETH`,
-    "",
-    "Most used features:",
-    ...topEntries(featureCounts, 8).map(([name, count]) => `${name}: ${count}`),
-    "",
-    "Most active users:",
-    ...users
-      .map(([id, user]) => [telegramName(user), (user.mintHistory || []).length + Object.values(user.featureUsage || {}).reduce((a, b) => a + b, 0)])
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([name, score]) => `${name}: ${score}`),
-    "",
-    "Unhandled interactions:",
-    ...unhandled.slice(0, 10).map((item) => `${item.type}: ${item.uniqueUsers} users, ${item.count} hits`)
-  ];
-
-  await safeSend(chatId, lines.join("\n"));
-}
-
-function getActiveWallet(user) {
-  if (!user || !Array.isArray(user.wallets) || !user.wallets.length) return null;
-  return user.wallets.find((wallet) => wallet.id === user.activeWalletId) || user.wallets[0];
-}
-
-function loadDb() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) {
-      return { version: 1, users: {} };
-    }
-
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    parsed.users = parsed.users || {};
-    return parsed;
-  } catch (err) {
-    console.error("Failed to load database:", err);
-    return { version: 1, users: {} };
-  }
-}
-
-function saveDb() {
-  if (pgPool) {
-    queuePostgresSave();
-    return;
-  }
-
-  ensureDataDir();
-  const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DATA_FILE);
-}
-
-function queuePostgresSave() {
-  if (pgSaveInFlight) {
-    pgSaveQueued = true;
-    return;
-  }
-
-  pgSaveInFlight = true;
-  persistDbToPostgres()
-    .catch((err) => {
-      console.error("PostgreSQL save failed:", err.message);
-    })
-    .finally(() => {
-      pgSaveInFlight = false;
-      if (pgSaveQueued) {
-        pgSaveQueued = false;
-        queuePostgresSave();
+// ─── MEMPOOL WATCHER ─────────────────────────────────────────────────────────
+function startMempoolWatcher(chatId,mint) {
+  if (!mint.contractAddress||!mint.mintTime) return;
+  if (mempoolWatchers.has(mint.id)) return;
+  let active=true;
+  const id=setInterval(async()=>{
+    if (!active) return;
+    const now=Date.now();
+    if (now<Number(mint.mintTime)-300000) return;
+    if (now>Number(mint.mintTime)+AUTO_MINT_DELAY_MS*2) { stopMempoolWatcher(mint.id); return; }
+    if (now>=Number(mint.mintTime)) return;
+    try {
+      const provider=getProvider(mint.chainId); const block=await provider.getBlock("latest");
+      if (block?.transactions?.length>0&&now<Number(mint.mintTime)) {
+        const user=getUser(chatId); const m=(user.mints||[]).find(x=>x.id===mint.id);
+        if (m?.autoMintEnabled&&!m.autoMint?.success) {
+          await tryAutoMint(chatId,mint.id,"mempool"); stopMempoolWatcher(mint.id);
+        }
       }
-    });
+    } catch {}
+  },15000);
+  mempoolWatchers.set(mint.id,{stop:()=>{active=false;clearInterval(id);}});
+}
+function stopMempoolWatcher(mintId) { const w=mempoolWatchers.get(mintId); if(w){w.stop();mempoolWatchers.delete(mintId);} }
+
+// ─── ADMIN / RESET ────────────────────────────────────────────────────────────
+async function resetState(chatId) {
+  const user=getUser(chatId); user.state={}; user.pendingMint=null; saveDb();
+  await send(chatId,"Cleared. Clean slate.",KEYBOARD);
 }
 
-async function persistDbToPostgres() {
-  if (!pgPool) return;
-  await pgPool.query(
-    `
-      INSERT INTO mintbot_state (id, data, updated_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()
-    `,
-    ["default", db]
-  );
+async function sendAdminStats(chatId,fromId) {
+  if (!ADMIN_ID||fromId!==ADMIN_ID) { await send(chatId,"Not authorized."); return; }
+  const users=db.users||{}; const total=Object.keys(users).length; const now=Date.now();
+  const active=Object.values(users).filter(u=>now-(u.lastActivityAt||0)<86400000).length;
+  let totalMints=0,totalFees=0;
+  for (const u of Object.values(users)) {
+    totalMints+=(u.mintHistory||[]).length;
+    totalFees+=Object.values(u.pendingFee||{}).reduce((s,f)=>s+parseFloat(f.feeEth||0),0);
+  }
+  const unhandled=db.analytics?.unhandled||{};
+  const ranked=Object.entries(unhandled).sort((a,b)=>b[1].count-a[1].count).slice(0,8);
+  const lines=["Admin Stats","",`Users:        ${total}`,`Active (24h): ${active}`,`Total mints:  ${totalMints}`,`Fees pending: ${totalFees.toFixed(6)} ETH`,""];
+  if (ranked.length) { lines.push("Top unhandled interactions:"); for (const [type,d] of ranked) lines.push(`  ${d.count}x (${d.userCount||"?"} users) — ${type}`); }
+  await send(chatId,lines.join("\n"));
 }
 
-function ensureDataDir() {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+function logUnhandled(chatId,text) {
+  db.analytics=db.analytics||{}; db.analytics.unhandled=db.analytics.unhandled||{};
+  const type=classifyUnhandled(text);
+  const entry=db.analytics.unhandled[type]||{count:0,userCount:0,users:[],samples:[]};
+  entry.count++;
+  if (!entry.users.includes(String(chatId))) { entry.users.push(String(chatId)); entry.userCount=entry.users.length; }
+  if (entry.samples.length<5) entry.samples.push(text.slice(0,80));
+  db.analytics.unhandled[type]=entry;
+  if (entry.count%10===0) saveDb();
 }
 
-function walletEncryptionReady() {
-  return WALLET_ENCRYPTION_KEY && WALLET_ENCRYPTION_KEY.length >= 16;
+function classifyUnhandled(text) {
+  const t=text.toLowerCase();
+  if (t.includes("can you")||t.includes("how do i")||t.includes("why can't")) return "feature_request";
+  if (t.includes("http")) return "unknown_url";
+  if (/0x[a-f0-9]{40}/i.test(t)) return "unknown_address";
+  return "unrecognized";
 }
 
-function encryptionKey() {
-  return crypto.createHash("sha256").update(WALLET_ENCRYPTION_KEY).digest();
-}
-
-function encryptPrivateKey(privateKey) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(privateKey, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
-}
-
-function decryptPrivateKey(payload) {
-  const [ivHex, tagHex, encryptedHex] = payload.split(":");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivHex, "hex"));
-  decipher.setAuthTag(Buffer.from(tagHex, "hex"));
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(encryptedHex, "hex")),
-    decipher.final()
-  ]);
-  return decrypted.toString("utf8");
-}
-
-function normalizePrivateKey(privateKey) {
-  const cleaned = privateKey.trim();
-  return cleaned.startsWith("0x") ? cleaned : `0x${cleaned}`;
-}
-
-function normalizeTier(tier) {
-  if (!tier) return null;
-  const value = String(tier).toLowerCase();
-  if (["gtd", "guaranteed", "guaranteed allocation"].includes(value)) return "gtd";
-  if (["og", "early", "early access"].includes(value)) return "og";
-  if (["wl", "whitelist", "allowlist", "al"].includes(value)) return "wl";
-  if (["public", "pub"].includes(value)) return "public";
-  return null;
-}
-
-function normalizeRiskMode(mode) {
-  const value = String(mode || "").toLowerCase();
-  if (value === "safe") return "safe";
-  if (value === "degenerate" || value === "degen") return "degenerate";
-  return "fast";
-}
-
-function riskModeForUser(user) {
-  return RISK_MODES[normalizeRiskMode(user && user.riskMode)] || RISK_MODES.fast;
-}
-
-function riskModeForMint(user, mint = null) {
-  const key = normalizeRiskMode((mint && mint.riskMode) || (user && user.riskMode));
-  return RISK_MODES[key] || RISK_MODES.fast;
-}
-
-function gasCapMultiplierPercent(user, mint = null) {
-  return riskModeForMint(user, mint).gasCapMultiplierPercent || DEFAULT_GAS_CAP_MULTIPLIER_PERCENT;
-}
-
-function extractTier(text) {
-  const match = text.match(/\b(gtd|guaranteed|og|wl|whitelist|allowlist|public)\b/i);
-  return match ? normalizeTier(match[1]) : null;
-}
-
-function extractQuantity(text) {
-  const match = text.match(/\b(?:qty|quantity|x)\s*(\d+)\b/i);
-  if (!match) return null;
-  const value = Number(match[1]);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
-}
-
-function normalizeTimestamp(value) {
-  if (!value) return null;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return null;
-  return numeric > 100000000000 ? numeric : numeric * 1000;
-}
-
-function firstKnownPhaseTime(value) {
-  return normalizeTimestamp(value.gtdTime)
-    || normalizeTimestamp(value.ogTime)
-    || normalizeTimestamp(value.wlTime)
-    || normalizeTimestamp(value.publicTime)
-    || null;
-}
-
-function extractAddress(text) {
-  const match = text.match(/0x[a-fA-F0-9]{40}/);
-  return match && ethers.isAddress(match[0]) ? ethers.getAddress(match[0]) : null;
-}
-
-function formatDateTime(timestamp) {
-  if (!timestamp) return "not set";
-  const date = new Date(Number(timestamp));
-
-  try {
-    const local = new Intl.DateTimeFormat("en-US", {
-      timeZone: DEFAULT_TIMEZONE,
-      month: "short",
-      day: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: true
-    }).format(date);
-    const utc = new Intl.DateTimeFormat("en-US", {
-      timeZone: "UTC",
-      month: "short",
-      day: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false
-    }).format(date);
-    return `${local} ${DEFAULT_TIMEZONE} (${utc} UTC)`;
-  } catch (err) {
-    return date.toISOString();
+function clearExpiredStates() {
+  const now=Date.now();
+  for (const [,user] of Object.entries(db.users||{})) {
+    if (user.state?.at&&now-user.state.at>STATE_TIMEOUT_MS) user.state={};
   }
 }
 
-function formatOptionalTime(timestamp) {
-  return timestamp ? formatDateTime(timestamp) : "not set";
+// ─── P&L ─────────────────────────────────────────────────────────────────────
+function getPnL(user) {
+  const history=user.mintHistory||[];
+  const spent=history.reduce((s,h)=>s+parseFloat(h.priceEth||0),0);
+  const profit=user.leaderboard?.totalProfit||0;
+  return {totalMints:history.length,spent,returned:spent+profit,net:profit};
 }
 
-function formatDuration(ms) {
-  if (!Number.isFinite(ms)) return "unknown";
-  if (ms <= 0) return "open now";
-
-  const totalSeconds = Math.floor(ms / 1000);
-  const days = Math.floor(totalSeconds / 86400);
-  const hours = Math.floor((totalSeconds % 86400) / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
+// ─── CONTRACT HELPERS ─────────────────────────────────────────────────────────
+async function verifyFromContract(draft) {
+  if (!draft.contractAddress||!ethers.isAddress(draft.contractAddress)) throw new Error("Need a valid contract address.");
+  const chainId=await resolveChainId(draft.contractAddress,draft.chainId);
+  const cfg=getChain(chainId); const provider=getProvider(cfg.chainId);
+  const abi=await resolveAbi({contractAddress:draft.contractAddress,chainId:cfg.chainId});
+  const readAbi=mergeAbi(abi,READ_ONLY_ABI);
+  const contract=new ethers.Contract(draft.contractAddress,readAbi,provider.getActive());
+  const times=await readPhaseTimes(contract); const price=await readPrice(contract,draft.userTier);
+  const fn=detectMintFn(new ethers.Interface(abi),draft.userTier);
+  const tier=normTier(draft.userTier)||"public";
+  return {...draft,...times,chainId:cfg.chainId,chainName:cfg.chainName,userTier:tier,mintTime:times[`${tier}Time`]||null,priceEth:price||draft.priceEth||null,mintFunction:fn||draft.mintFunction||null};
 }
 
-function formatGwei(value) {
-  return Number(ethers.formatUnits(value, "gwei")).toFixed(2);
-}
-
-function parseEthAmount(text) {
-  const match = String(text).trim().match(/^(\d+(?:\.\d+)?)\s*(?:eth)?$/i);
-  if (!match) return null;
-  const value = Number(match[1]);
-  return Number.isFinite(value) ? match[1] : null;
-}
-
-function firstFiniteNumber(...values) {
-  for (const value of values) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric) && numeric > 0) {
-      return Math.floor(numeric);
-    }
+async function readPhaseTimes(contract) {
+  const result={};
+  for (const [tier,names] of Object.entries(PHASE_TIMES)) {
+    for (const name of names) { const ts=await tryTimestamp(contract,name); if(ts){result[`${tier}Time`]=ts;break;} }
   }
-  return null;
-}
-
-function trimEth(value) {
-  return String(value).replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
-}
-
-function shortAddress(address) {
-  if (!address) return "none";
-  return `${address.slice(0, 6)}...${address.slice(-4)}`;
-}
-
-function telegramName(user) {
-  return user.username ? `@${user.username}` : (user.firstName || "User");
-}
-
-function telegramProfileLink(user) {
-  const userId = user.telegramUserId || "";
-  const name = escapeHtml(telegramName(user));
-  return userId ? `<a href="tg://user?id=${escapeHtml(userId)}">${name}</a>` : name;
-}
-
-function pendingFeeForChain(user, chainId) {
-  return (user.pendingFees || [])
-    .filter((fee) => Number(fee.chainId) === Number(chainId))
-    .reduce((sum, fee) => sum + Number(fee.feeEth || 0), 0);
-}
-
-function pendingFeeWeiForChain(user, chainId) {
-  return (user.pendingFees || [])
-    .filter((fee) => Number(fee.chainId) === Number(chainId))
-    .reduce((sum, fee) => sum + ethers.parseEther(String(fee.feeEth || 0)), 0n);
-}
-
-function clearPendingFeesForChain(user, chainId) {
-  user.pendingFees = (user.pendingFees || []).filter((fee) => Number(fee.chainId) !== Number(chainId));
-}
-
-function pendingProfitAgreementLine(user, chainId) {
-  const fees = (user.pendingFees || []).filter((fee) => Number(fee.chainId) === Number(chainId));
-  if (!fees.length) return "";
-
-  const totalFee = fees.reduce((sum, fee) => sum + Number(fee.feeEth || 0), 0);
-  if (fees.length === 1) {
-    const nftName = fees[0].nftName || "that";
-    return `Pending profit agreement from ${nftName} NFT: ${trimEth(totalFee.toFixed(6))} ETH`;
-  }
-
-  return `Pending profit agreements from ${fees.length} NFTs: ${trimEth(totalFee.toFixed(6))} ETH`;
-}
-
-async function fundingSnapshot(user) {
-  const wallet = getActiveWallet(user);
-  const nextMint = nextLiveMint(user) || user.pendingMint || null;
-
-  if (!wallet) {
-    return null;
-  }
-
-  const result = {
-    walletAddress: wallet.address,
-    network: nextMint ? nextMint.chainName : null,
-    targetEth: null,
-    balanceEth: null,
-    shortfallEth: null
-  };
-
-  if (!nextMint) {
-    return result;
-  }
-
-  const provider = getProvider(nextMint.chainId);
-  const balanceWei = await provider.getBalance(wallet.address);
-  const mintValue = resolveMintValue(nextMint);
-  let gasCapEth = nextMint.gasCapEth || nextMint.recommendedGasCapEth || null;
-
-  if (!gasCapEth) {
-    const estimate = await estimateGasCap(0, user, nextMint).catch(() => null);
-    gasCapEth = estimate && estimate.gasCapEth ? estimate.gasCapEth : null;
-  }
-
-  const gasCapWei = gasCapEth ? ethers.parseEther(String(gasCapEth)) : 0n;
-  const targetWei = mintValue + gasCapWei;
-  const shortfallWei = targetWei > balanceWei ? targetWei - balanceWei : 0n;
-
-  result.targetEth = trimEth(ethers.formatEther(targetWei));
-  result.balanceEth = trimEth(ethers.formatEther(balanceWei));
-  result.shortfallEth = trimEth(ethers.formatEther(shortfallWei));
   return result;
 }
 
-async function buildPnlDashboard(user) {
-  const history = (user.mintHistory || []).filter((item) => item.status === "confirmed");
-  const mintedTokens = user.mintedTokens || [];
-  const soldTokens = mintedTokens.filter((token) => token.soldAt && token.lastSalePriceEth != null);
-  const unsoldTokens = mintedTokens.filter((token) => !token.soldAt);
-  const statsCache = new Map();
-
-  const totalSpent = history.reduce((sum, item) => sum + Number(item.totalCostEth || item.valueEth || 0), 0);
-  const realized = soldTokens.map((token) => {
-    const mintPrice = Number(token.mintPriceEth || 0);
-    const salePrice = Number(token.lastSalePriceEth || 0);
-    return {
-      token,
-      profit: salePrice - mintPrice
-    };
-  });
-
-  let totalUnrealized = 0;
-  for (const token of unsoldTokens.slice(0, 20)) {
-    const floor = await estimatedTokenValueEth(token, statsCache).catch(() => null);
-    if (floor == null) continue;
-    totalUnrealized += floor - Number(token.mintPriceEth || 0);
-  }
-
-  const best = realized.length
-    ? realized.reduce((max, item) => item.profit > max.profit ? item : max, realized[0])
-    : null;
-  const worst = realized.length
-    ? realized.reduce((min, item) => item.profit < min.profit ? item : min, realized[0])
-    : null;
-
-  return {
-    totalSpentEth: trimEth(totalSpent.toFixed(6)),
-    totalWins: realized.filter((item) => item.profit > 0).length,
-    totalRealizedProfitEth: trimEth(realized.reduce((sum, item) => sum + item.profit, 0).toFixed(6)),
-    totalUnrealizedProfitEth: trimEth(totalUnrealized.toFixed(6)),
-    bestHit: best ? `${displayMintedTokenName(best.token)} (${trimEth(best.profit.toFixed(6))} ETH)` : "No realized wins yet",
-    worstHit: worst ? `${displayMintedTokenName(worst.token)} (${trimEth(worst.profit.toFixed(6))} ETH)` : "No realized losses yet"
-  };
+async function readPrice(contract,tier) {
+  const names=[...(PHASE_PRICES[normTier(tier)]||[]),...PRICE_READS];
+  for (const name of [...new Set(names)]) { const v=await tryUint(contract,name); if(v!=null) return ethers.formatEther(v); }
+  return null;
 }
 
-async function estimatedTokenValueEth(token, statsCache = new Map()) {
-  if (!process.env.OPENSEA_API_KEY) return null;
-  const slug = token.openSeaSlug;
-  if (!slug) return null;
-  if (!statsCache.has(slug)) {
-    statsCache.set(slug, fetchOpenSeaCollection(slug, token.chainId).catch(() => null));
-  }
-  const collection = await statsCache.get(slug);
-  return extractFloorPriceEth(collection && collection.stats);
+async function tryTimestamp(contract,name) {
+  const v=await tryUint(contract,name); if(v==null) return null;
+  const n=Number(v); if(!Number.isFinite(n)||n<=0) return null;
+  return n>100000000000?n:n*1000;
 }
 
-function extractFloorPriceEth(stats) {
-  const candidates = [
-    stats && stats.floor_price,
-    stats && stats.total && stats.total.floor_price,
-    stats && stats.total && stats.total.floorPrice,
-    stats && stats.floorPrice
-  ];
-  for (const value of candidates) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric) && numeric >= 0) {
-      return numeric;
-    }
+async function tryUint(contract,name) {
+  try { if(typeof contract[name]!=="function") return null; const v=await contract[name](); return typeof v==="bigint"?v:BigInt(v.toString()); }
+  catch { return null; }
+}
+
+function detectMintFn(iface,tier) {
+  const frags=iface.fragments.filter(f=>f.type==="function"&&["payable","nonpayable"].includes(f.stateMutability));
+  const hints={gtd:["gtd","guaranteed"],og:["og","presale","private"],wl:["wl","white","allow","pre"],public:["public","mint"]}[normTier(tier)]||[];
+  const match=frags.find(f=>{const l=f.name.toLowerCase();return hints.some(h=>l.includes(h))&&MINT_FN_PRIORITY.includes(f.name);});
+  if (match) return match.name;
+  return frags.find(f=>MINT_FN_PRIORITY.includes(f.name))?.name||null;
+}
+
+function pickMintFn(iface,mint,walletAddress) {
+  const frags=iface.fragments.filter(f=>f.type==="function"&&["payable","nonpayable"].includes(f.stateMutability));
+  const explicit=mint.mintFunction?frags.filter(f=>f.name.toLowerCase()===mint.mintFunction.toLowerCase()):[];
+  const common=frags.filter(f=>MINT_FN_PRIORITY.includes(f.name)).sort((a,b)=>MINT_FN_PRIORITY.indexOf(a.name)-MINT_FN_PRIORITY.indexOf(b.name));
+  const seen=new Set();
+  for (const frag of [...explicit,...common]) {
+    const key=`${frag.name}(${(frag.inputs||[]).map(i=>i.type).join(",")})`;
+    if (seen.has(key)) continue; seen.add(key);
+    const args=buildArgs(frag,mint,walletAddress); if(!args) continue;
+    return {fragment:frag,functionKey:frag.name,args};
   }
   return null;
 }
 
-function qrCodeUrl(value) {
-  return `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(String(value || ""))}`;
-}
-
-async function sendTxResult(chatId, title, txHash, chainId) {
-  const url = explorerTxUrl(chainId, txHash);
-  const options = url
-    ? {
-        reply_markup: {
-          inline_keyboard: [[{ text: "View Transaction", url }]]
-        }
-      }
-    : {};
-
-  await safeSend(
-    chatId,
-    [
-      title,
-      "Submitted. Tap below to view it."
-    ].join("\n"),
-    options
-  );
-}
-
-function explorerTxUrl(chainId, txHash) {
-  if (!txHash) return "";
-  if (Number(chainId) === 8453) return `https://basescan.org/tx/${txHash}`;
-  if (Number(chainId) === 1) return `https://etherscan.io/tx/${txHash}`;
-  return "";
-}
-
-function openSeaAssetUrl(chainId, contractAddress, tokenId) {
-  const chain = getChainConfig(chainId);
-  if (!chain || !contractAddress || tokenId == null) return "";
-  return Number(chain.chainId) === 1
-    ? `https://opensea.io/assets/ethereum/${contractAddress}/${tokenId}`
-    : `https://opensea.io/assets/${chain.openSeaChain}/${contractAddress}/${tokenId}`;
-}
-
-function openSeaSdkChain(chainId, ChainEnum = {}) {
-  if (Number(chainId) === 8453) {
-    return ChainEnum.Base || "base";
-  }
-  return ChainEnum.Mainnet || ChainEnum.Ethereum || "mainnet";
-}
-
-function userFriendlyError(err, fallback = "That action did not go through. Try again or buy from the mint page.") {
-  const message = err && err.message ? String(err.message).toLowerCase() : String(err || "").toLowerCase();
-
-  if (message.includes("gas cap exceeded")) {
-    return "Gas ran over your limit, so the bot skipped the buy instead of chasing it.";
-  }
-  if (message.includes("insufficient eth") || message.includes("insufficient funds")) {
-    return "Your live wallet does not have enough ETH for the buy and gas.";
-  }
-  if (message.includes("no compatible mint function") || message.includes("custom function")) {
-    return "This drop needs extra steps from the mint page. Buy it from the official page instead.";
-  }
-  if (message.includes("private relay") || message.includes("flashbots")) {
-    return "Private send is unavailable for this drop right now. Turn it off or buy from the mint page.";
-  }
-  if (message.includes("approval") || message.includes("approved")) {
-    return "OpenSea needs one approval before this item can be listed. Open it once on OpenSea, approve it, then come back.";
-  }
-  if (message.includes("opensea")) {
-    return "OpenSea could not finish that request right now. Try again in a moment.";
-  }
-  if (message.includes("revert") || message.includes("not active") || message.includes("not live")) {
-    return "The drop was not open for that try. The bot will keep trying while your retry window is still alive.";
-  }
-  if (message.includes("wallet") || message.includes("private key")) {
-    return "Set a live mint wallet first.";
-  }
-
-  return fallback;
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function groupUnhandledInteractions() {
-  const groups = new Map();
-  for (const item of (db.analytics && db.analytics.unhandled) || []) {
-    const key = item.type || "unknown";
-    const existing = groups.get(key) || { type: key, count: 0, users: new Set() };
-    existing.count += 1;
-    existing.users.add(item.userId);
-    groups.set(key, existing);
-  }
-  return [...groups.values()]
-    .map((item) => ({ type: item.type, count: item.count, uniqueUsers: item.users.size }))
-    .sort((a, b) => b.uniqueUsers - a.uniqueUsers || b.count - a.count);
-}
-
-function topEntries(object, limit = 5) {
-  return Object.entries(object || {}).sort((a, b) => b[1] - a[1]).slice(0, limit);
-}
-
-function redactSensitive(value) {
-  return String(value)
-    .replace(/0x[a-fA-F0-9]{64}/g, "[private-key]")
-    .replace(/[A-Za-z0-9+/=]{80,}/g, "[long-token]");
-}
-
-function shortError(err) {
-  const message = err && err.message ? err.message : String(err);
-  return message.replace(/\s+/g, " ").slice(0, 240);
-}
-
-function randomId(bytes = 8) {
-  return crypto.randomBytes(bytes).toString("hex");
-}
-
-function timerKeyFor(chatId, mintId) {
-  return `${chatId}:${mintId}`;
-}
-
-function rememberHistory(user, role, content) {
-  user.history = user.history || [];
-  user.history.push({ role, content: String(content).slice(0, 2000) });
-  user.history = user.history.slice(-10);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function safeSend(chatId, text, options = {}) {
-  try {
-    return await bot.sendMessage(chatId, text, {
-      disable_web_page_preview: true,
-      ...options
-    });
-  } catch (err) {
-    console.error("sendMessage failed:", err.message);
+function buildArgs(frag,mint,walletAddress) {
+  if (Array.isArray(mint.mintArgs)) return mint.mintArgs;
+  const args=[];
+  for (const input of frag.inputs) {
+    const t=input.type;
+    if (/^uint/.test(t)) { args.push(BigInt(mint.quantity||1)); continue; }
+    if (t==="address")  { args.push(walletAddress); continue; }
+    if (t==="bytes32[]"||t==="bytes[]") { if(Array.isArray(mint.merkleProof)){args.push(mint.merkleProof);continue;} return null; }
+    if (t==="bytes32"||t==="bytes")     { if(mint.proof){args.push(mint.proof);continue;} return null; }
+    if (t==="bool") { args.push(true); continue; }
     return null;
   }
+  return args;
 }
 
-async function safeEdit(chatId, messageId, text, options = {}) {
-  try {
-    return await bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      disable_web_page_preview: true,
-      ...options
-    });
-  } catch (err) {
-    console.error("editMessageText failed:", err.message);
-    return null;
-  }
+function mintValue(mint) {
+  if (mint.totalValueEth) return ethers.parseEther(String(mint.totalValueEth));
+  if (!mint.priceEth) return 0n;
+  return ethers.parseEther(String(mint.priceEth))*BigInt(mint.quantity||1);
 }
 
-async function safeSendPhoto(chatId, photo, options = {}) {
-  try {
-    return await bot.sendPhoto(chatId, photo, options);
-  } catch (err) {
-    console.error("sendPhoto failed:", err.message);
-    return null;
-  }
+async function resolveGasLimit(contract,cand,value) {
+  try { const e=await contract[cand.functionKey].estimateGas(...cand.args,{value}); return (e*130n)/100n; }
+  catch { return DEFAULT_GAS_LIMIT; }
 }
 
-async function safeDelete(chatId, messageId) {
+async function resolveAbi(mint) {
+  if (!process.env.ETHERSCAN_API_KEY) return COMMON_ABI;
   try {
-    await bot.deleteMessage(chatId, messageId);
-  } catch (err) {
-    // Telegram only allows deleting recent messages and messages the bot can access.
-  }
+    const url=new URL("https://api.etherscan.io/v2/api");
+    url.searchParams.set("chainid",String(mint.chainId||defaultChain().chainId));
+    url.searchParams.set("module","contract"); url.searchParams.set("action","getabi");
+    url.searchParams.set("address",mint.contractAddress); url.searchParams.set("apikey",process.env.ETHERSCAN_API_KEY);
+    const data=await fetchJson(url.toString());
+    if (data.status!=="1") return COMMON_ABI;
+    return JSON.parse(data.result);
+  } catch { return COMMON_ABI; }
 }
+
+async function resolveChainId(contractAddress,preferred) {
+  const p=getChain(preferred);
+  if (p&&providers.has(p.chainId)) { const code=await providers.get(p.chainId).getCode(contractAddress).catch(()=>"0x"); if(code&&code!=="0x") return p.chainId; }
+  for (const [id,prov] of providers) { if(p&&id===p.chainId) continue; const code=await prov.getCode(contractAddress).catch(()=>"0x"); if(code&&code!=="0x") return id; }
+  return p?.chainId||defaultChain().chainId;
+}
+
+async function estGasCap(mint) {
+  try { const p=getProvider(mint.chainId); const fee=await p.getFeeData(); const price=fee.maxFeePerGas||fee.gasPrice||0n; return parseFloat(ethers.formatEther((DEFAULT_GAS_LIMIT*price*110n)/100n)).toFixed(6); }
+  catch { return null; }
+}
+
+function mergeAbi(a,b) {
+  const seen=new Set(),out=[];
+  for (const item of [...a,...b]) { const k=typeof item==="string"?item:JSON.stringify(item); if(seen.has(k)) continue; seen.add(k); out.push(item); }
+  return out;
+}
+
+function getChain(chainIdOrKey) {
+  if (!chainIdOrKey) return null;
+  const s=String(chainIdOrKey).toLowerCase();
+  return Object.values(CHAIN).find(c=>String(c.chainId)===s||c.key===s||c.openSeaChain===s||c.chainName.toLowerCase()===s)||null;
+}
+function defaultChain() { return getChain(LEGACY_CHAIN_ID)||CHAIN.ethereum; }
+function getProvider(chainIdOrKey) {
+  const cfg=getChain(chainIdOrKey)||defaultChain(); const p=providers.get(cfg.chainId);
+  if (!p) throw new Error(`${cfg.chainName} RPC not configured. Add ${cfg.key==="ethereum"?"ETHEREUM_RPC_URL":"BASE_RPC_URL"} to .env.`);
+  return p;
+}
+
+// ─── OPENSEA ──────────────────────────────────────────────────────────────────
+async function fetchOsCollection(slug,preferredChainId=null) {
+  if (!process.env.OPENSEA_API_KEY) return {name:slug,slug};
+  const [col,stats]=await Promise.allSettled([
+    fetchJson(`https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}`,osHeaders()),
+    fetchJson(`https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`,osHeaders())
+  ]);
+  const c=col.status==="fulfilled"?col.value:{}; const s=stats.status==="fulfilled"?stats.value:{};
+  const contracts=c.contracts||c.primary_asset_contracts||[];
+  const chosen=pickContract(contracts,preferredChainId);
+  const chain=chosen?.chainId?getChain(chosen.chainId):getChain(preferredChainId);
+  return {slug,name:c.name||slug,contractAddress:chosen?.address&&ethers.isAddress(chosen.address)?ethers.getAddress(chosen.address):null,chainId:chain?.chainId||null,chainName:chain?.chainName||null,stats:s};
+}
+
+function pickContract(contracts,preferredChainId) {
+  const normalized=(contracts||[]).map(c=>{const addr=typeof c==="string"?c:c.address;const chainId=typeof c==="object"?normOsChain(c.chain||c.blockchain||c.network):null;return{address:addr,chainId};}).filter(c=>c.address&&ethers.isAddress(c.address));
+  if (!normalized.length) return null;
+  const pref=getChain(preferredChainId);
+  if (pref) { const m=normalized.find(c=>c.chainId===pref.chainId); if(m) return m; }
+  return normalized.find(c=>getChain(c.chainId))||normalized[0];
+}
+
+function parseOsUrl(text) {
+  try {
+    const url=new URL(text);
+    if (!/opensea\.io$/i.test(url.hostname.replace(/^www\./,""))) return {};
+    const parts=url.pathname.split("/").filter(Boolean);
+    const chainId=parts.map(normOsChain).find(Boolean)||null;
+    const base={isOpenSea:true,path:url.pathname,chainId};
+    if (parts[0]==="collection"&&parts[1]) return {...base,slug:parts[1]};
+    if (parts[0]==="drop"&&parts[1])       return {...base,slug:parts[1]};
+    const addr=parts.find(p=>ethers.isAddress(p));
+    if (addr) return {...base,contractAddress:ethers.getAddress(addr)};
+    return {...base,slug:parts[1]||parts[0]};
+  } catch { return {}; }
+}
+
+function normOsChain(v) { if(!v) return null; return OS_CHAIN_TO_ID[String(v).toLowerCase()]||null; }
+function osHeaders()    { return process.env.OPENSEA_API_KEY?{"x-api-key":process.env.OPENSEA_API_KEY}:{}; }
+
+async function fetchJson(url,headers={}) {
+  const res=await fetch(url,{headers}); const text=await res.text();
+  if (!res.ok) throw new Error(`${res.status}: ${text.slice(0,150)}`);
+  try { return JSON.parse(text); } catch { throw new Error(`Invalid JSON from ${url}`); }
+}
+
+// ─── DB ───────────────────────────────────────────────────────────────────────
+function getUser(chatId) {
+  const key=String(chatId); db.users=db.users||{};
+  if (!db.users[key]) db.users[key]={wallets:[],activeWalletId:null,mints:[],pendingMint:null,mintHistory:[],state:{},leaderboard:{},pendingFee:{},createdAt:Date.now()};
+  return db.users[key];
+}
+
+function saveProfile(chatId,from) {
+  if (!from) return; const user=getUser(chatId); const prev=user.profile||{};
+  user.profile={telegramId:from.id,firstName:from.first_name||null,username:from.username||null,updatedAt:Date.now()};
+  user.lastActivityAt=Date.now();
+  if (Date.now()-(prev._lastSaved||0)>300000) { user.profile._lastSaved=Date.now(); saveDb(); }
+}
+
+function activeWallet(user) { if (!user?.wallets?.length) return null; return user.wallets.find(w=>w.id===user.activeWalletId)||user.wallets[0]; }
+
+function loadDb() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return {version:3,users:{},analytics:{}};
+    const p=JSON.parse(fs.readFileSync(DATA_FILE,"utf8")); p.users=p.users||{}; p.analytics=p.analytics||{}; return p;
+  } catch { return {version:3,users:{},analytics:{}}; }
+}
+
+function saveDb() { ensureDataDir(); const tmp=`${DATA_FILE}.tmp`; fs.writeFileSync(tmp,JSON.stringify(db,null,2)); fs.renameSync(tmp,DATA_FILE); }
+function ensureDataDir() { fs.mkdirSync(path.dirname(DATA_FILE),{recursive:true}); }
+
+// ─── CRYPTO ───────────────────────────────────────────────────────────────────
+function encReady()  { return WALLET_KEY?.length>=16; }
+function encKey_()   { return crypto.createHash("sha256").update(WALLET_KEY).digest(); }
+function encryptKey(key) { const iv=crypto.randomBytes(12); const c=crypto.createCipheriv("aes-256-gcm",encKey_(),iv); const enc=Buffer.concat([c.update(key,"utf8"),c.final()]); const tag=c.getAuthTag(); return `${iv.toString("hex")}:${tag.toString("hex")}:${enc.toString("hex")}`; }
+function decryptKey(payload) { const [ivH,tagH,encH]=payload.split(":"); const d=crypto.createDecipheriv("aes-256-gcm",encKey_(),Buffer.from(ivH,"hex")); d.setAuthTag(Buffer.from(tagH,"hex")); return Buffer.concat([d.update(Buffer.from(encH,"hex")),d.final()]).toString("utf8"); }
+function normKey(k) { const s=k.trim(); return s.startsWith("0x")?s:`0x${s}`; }
+
+// ─── LEADERBOARD HELPER ───────────────────────────────────────────────────────
+function lbAdd(chatId,field,delta) { const user=getUser(String(chatId)); user.leaderboard=user.leaderboard||{}; user.leaderboard[field]=(user.leaderboard[field]||0)+delta; }
+
+// ─── MINT RECORD ─────────────────────────────────────────────────────────────
+function buildMintRecord(parsed,draft) {
+  const merged={...(draft||{}),...(parsed||{})};
+  const tier=normTier(merged.userTier)||"public";
+  const chain=getChain(merged.chainId||merged.chainName)||defaultChain();
+  const mintTime=normTs(merged[`${tier}Time`])||normTs(merged.mintTime)||firstPhase(merged);
+  return {
+    id:uid(10),mintName:merged.mintName||merged.openSeaSlug||"NFT Mint",userTier:tier,
+    gtdTime:normTs(merged.gtdTime),ogTime:normTs(merged.ogTime),wlTime:normTs(merged.wlTime),publicTime:normTs(merged.publicTime),mintTime,
+    contractAddress:merged.contractAddress&&ethers.isAddress(merged.contractAddress)?ethers.getAddress(merged.contractAddress):null,
+    chainId:chain.chainId,chainName:chain.chainName,
+    priceEth:merged.priceEth!=null?String(merged.priceEth):null,
+    totalValueEth:merged.totalValueEth!=null?String(merged.totalValueEth):null,
+    quantity:Math.max(1,Number(merged.quantity||1)),
+    mintFunction:merged.mintFunction||null,mintArgs:Array.isArray(merged.mintArgs)?merged.mintArgs:null,
+    sourceUrl:merged.sourceUrl||null,openSeaSlug:merged.openSeaSlug||null,metadata:merged.metadata||null,
+    confirmed:false,remindersEnabled:merged.remindersEnabled!==false,autoMintEnabled:merged.autoMintEnabled!==false,
+    gasWarMode:merged.gasWarMode||false,flashbotsEnabled:merged.flashbotsEnabled||false,
+    firedReminders:[],openAlertSent:false,
+    autoMint:{scheduled:false,attempts:0,success:false,inFlight:false,txHash:null,lastError:null},
+    createdAt:Date.now(),updatedAt:Date.now()
+  };
+}
+
+// ─── UTIL ─────────────────────────────────────────────────────────────────────
+function normTier(tier) {
+  if (!tier) return null; const v=String(tier).toLowerCase();
+  if (["gtd","guaranteed"].includes(v))                return "gtd";
+  if (["og","early","early access"].includes(v))       return "og";
+  if (["wl","whitelist","allowlist","al"].includes(v)) return "wl";
+  if (["public","pub"].includes(v))                    return "public";
+  return null;
+}
+function extractTier(text) { const m=text.match(/\b(gtd|guaranteed|og|wl|whitelist|allowlist|public)\b/i); return m?normTier(m[1]):null; }
+function extractQty(text)  { const m=text.match(/\b(?:qty|quantity|x)\s*(\d+)\b/i); if(!m) return null; const v=Number(m[1]); return Number.isFinite(v)&&v>0?Math.floor(v):null; }
+function normTs(v)         { if(!v) return null; const n=Number(v); if(!Number.isFinite(n)) return null; return n>100000000000?n:n*1000; }
+function firstPhase(v)     { return normTs(v.gtdTime)||normTs(v.ogTime)||normTs(v.wlTime)||normTs(v.publicTime)||null; }
+function extractAddr(text) { const m=text.match(/0x[a-fA-F0-9]{40}/); return m&&ethers.isAddress(m[0])?ethers.getAddress(m[0]):null; }
+
+function formatDt(ts) {
+  if (!ts) return "—";
+  try { return new Intl.DateTimeFormat("en-US",{timeZone:DEFAULT_TIMEZONE,month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:true}).format(new Date(Number(ts)))+` ${DEFAULT_TIMEZONE}`; }
+  catch { return new Date(Number(ts)).toISOString(); }
+}
+function formatDur(ms) {
+  if (!Number.isFinite(ms)) return "—"; if (ms<=0) return "open now";
+  const s=Math.floor(ms/1000),d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60;
+  if (d>0) return `${d}d ${h}h`; if (h>0) return `${h}h ${m}m`; if (m>0) return `${m}m ${sec}s`; return `${sec}s`;
+}
+
+function fmtGwei(v)     { return Number(ethers.formatUnits(v,"gwei")).toFixed(2); }
+function shortAddr(a)   { return a?`${a.slice(0,6)}...${a.slice(-4)}`:"—"; }
+function shortErr(err)  { return ((err?.message||String(err)).replace(/\s+/g," ").slice(0,200)); }
+function uid(bytes=8)   { return crypto.randomBytes(bytes).toString("hex"); }
+function sleep(ms)      { return new Promise(r=>setTimeout(r,ms)); }
+function looksLikeMint(t){ return /\b(mint|drop|wl|whitelist|allowlist|gtd|guaranteed|og|public|presale|contract|0x[a-fA-F0-9]{40})\b/i.test(t); }
+
+async function quickBalance(wallet) {
+  try { const p=getProvider(defaultChain().chainId); const bal=await p.getBalance(wallet.address); return `(${parseFloat(ethers.formatEther(bal)).toFixed(4)} ETH)`; }
+  catch { return ""; }
+}
+
+async function send(chatId,text,opts={}) {
+  try { return await bot.sendMessage(chatId,text,{disable_web_page_preview:true,...opts}); }
+  catch(err) { console.error("sendMessage failed:",err.message); return null; }
+}
+async function safeEdit(chatId,messageId,text,opts={}) {
+  try { return await bot.editMessageText(text,{chat_id:chatId,message_id:messageId,disable_web_page_preview:true,...opts}); }
+  catch(err) { console.error("editMessageText failed:",err.message); return null; }
+}
+async function safeDelete(chatId,messageId) { try { await bot.deleteMessage(chatId,messageId); } catch {} }
+
+console.log("MintBot v3 running.");

@@ -1,243 +1,113 @@
-# MintBot
+# MintBot v3
 
-Telegram NFT mint tracker with controlled setup, inline confirmation, encrypted wallet storage, reminders, phase-specific auto-mint timers, and retry polling.
+Telegram NFT mint bot. Auto-mints, Gas War mode, Flashbots, multi-wallet blast, mempool watching, multi-RPC fallback, top offer alerts, rarity snipe, sale detection, OpenSea listing, leaderboard, trending, and a transparent 5% profit-only fee system.
 
-## What It Does
+## Files in this repo
 
-- Users paste an OpenSea mint URL.
-- The bot verifies phase time and price through contract reads when exposed by the mint contract.
-- The bot sends a confirmation card with Confirm / Cancel and toggles for reminders and auto-mint.
-- Nothing is armed until the user confirms.
-- Each user gets a timer for the phase they are eligible for: GTD, OG, WL, or public.
-- Auto-mint fires 5 seconds after that phase opens, then the 30-second poller retries during the configured retry window.
-- Wallets can be created or imported from Telegram.
-- Private keys are encrypted at rest with `WALLET_ENCRYPTION_KEY`.
-- Gas, portfolio, trending, status, and mint history menu actions are included.
-- Gas caps are approved per mint before confirmation.
-- Gas War mode escalates retry gas while respecting the user's cap.
-- Instant Mint, Receive, Send NFT, Send Token, leaderboard, and admin stats are included.
-- PostgreSQL storage is supported through `DATABASE_URL`; JSON remains a local development fallback.
-- A transparent profit-fee disclosure is shown before mint confirmation.
+| File | What it is |
+|---|---|
+| `index.js` | The entire bot — 1,500+ lines, single process |
+| `package.json` | Dependencies |
+| `.env.example` | Every environment variable with descriptions |
+| `DEPLOY.md` | Full step-by-step deployment guide |
+| `MintRegistry.sol` | On-chain mint price recorder (deploy on ETH + Base) |
+| `FeeRouter.sol` | Fee splitter contract (deploy on ETH + Base) |
 
-## Security Notes
-
-This bot can submit real blockchain transactions. Use a fresh mint wallet only.
-
-Do not run this with your main wallet. Keep only the ETH needed for the mint and gas in the wallet. The bot deletes private-key Telegram messages after import, but Telegram delivery is still not the same as a hardware wallet or local signer.
-
-Private keys are encrypted in `data/mintbot.json`, but whoever controls the server and `.env` can decrypt them. Treat the server as sensitive infrastructure.
-
-## Setup
+## Quick start (local)
 
 ```bash
-cd /home/khalex/mintbot
 npm install
 cp .env.example .env
-```
-
-Edit `.env`:
-
-```bash
-TELEGRAM_BOT_TOKEN=...
-ETHEREUM_RPC_URL=...
-BASE_RPC_URL=...
-WALLET_ENCRYPTION_KEY=...
-ETHERSCAN_API_KEY=...
-OPENSEA_API_KEY=...
-DATABASE_URL=...
-ADMIN_USER_ID=...
-TREASURY_WALLET=...
-```
-
-Generate an encryption key:
-
-```bash
-openssl rand -hex 32
-```
-
-Start the bot:
-
-```bash
+# Fill in .env
 npm start
 ```
 
-## Deploy To Railway From GitHub
-
-1. Create a GitHub repo and push this `mintbot` folder.
-2. In Railway, create a new project from the GitHub repo.
-3. Add the environment variables from `.env.example` in Railway Variables.
-4. Add a Railway volume if you want wallets/mints/history to survive redeploys.
-5. Deploy.
-
-This repo includes:
-
-- `railway.json` with `npm start` as the start command
-- `Procfile` with a worker process
-- `.dockerignore` so local secrets and installs are not uploaded
-- `.gitignore` so `.env`, `node_modules`, and runtime JSON data stay out of GitHub
-- `contracts/` with `MintRegistry.sol` and `FeeRouter.sol` sources for Ethereum/Base deployment
-
-For persistent storage, attach a Railway volume to the service. The bot automatically uses `RAILWAY_VOLUME_MOUNT_PATH/mintbot.json` when Railway provides that variable. You can also set `DATA_FILE` manually.
-
-Required Railway variables:
-
-```bash
-TELEGRAM_BOT_TOKEN=...
-ETHEREUM_RPC_URL=...
-BASE_RPC_URL=...
-WALLET_ENCRYPTION_KEY=...
-ETHERSCAN_API_KEY=...
-OPENSEA_API_KEY=...
-DATABASE_URL=...
-ADMIN_USER_ID=...
-TREASURY_WALLET=...
-ALCHEMY_WEBHOOK_AUTH_TOKEN=...
-```
-
-Generate `WALLET_ENCRYPTION_KEY` locally:
-
+Generate encryption key:
 ```bash
 openssl rand -hex 32
 ```
 
-## Telegram Flow
+## Deploy to Railway
 
-Use `/start` to open the menu.
+See `DEPLOY.md` for the complete step-by-step. The short version:
 
-Users can:
+1. Push this repo to GitHub (private)
+2. New Railway project → Deploy from GitHub repo
+3. Add all variables from `.env.example` in Railway Variables tab
+4. Add a Railway Volume mounted at `/data`
+5. Deploy
 
-- Tap `Wallet` to create/import/switch wallets.
-- Tap `Track NFT` and paste an OpenSea mint URL.
-- Example:
+## Smart contracts
 
-```text
-https://opensea.io/collection/example
+Deploy `MintRegistry.sol` and `FeeRouter.sol` on both Ethereum mainnet and Base using [Remix](https://remix.ethereum.org). Paste the four resulting addresses into your Railway env vars. Full instructions in `DEPLOY.md`.
+
+## Keyboard
+
+```
+Track  |  Wallet
+Status |  Gas  |  History
 ```
 
-## Supported Chains
+## Start screen inline buttons
 
-The bot supports Ethereum mainnet and Base mainnet in the same deployment.
+⚡ Instant Mint · 📊 Track a Drop
+📤 Send NFT · 📥 Receive
+🏆 Leaderboard · 🔥 Trending
+💣 Blast Mint
 
-- Ethereum uses `ETHEREUM_RPC_URL`
-- Base uses `BASE_RPC_URL`
-- OpenSea asset URLs with `ethereum` or `base` in the path are routed to the matching chain
-- Collection URLs are resolved through OpenSea collection metadata when `OPENSEA_API_KEY` is set
+## Commands
 
-The bot replies with a confirmation card:
+| Command | What it does |
+|---|---|
+| `/start` | Dashboard |
+| `/track` | Track a drop |
+| `/wallet` | Wallet management |
+| `/status` | Active mints + instant fire buttons |
+| `/gas` | Gas prices + Gas War toggle |
+| `/history` | Mint history and P&L |
+| `/trending` | Hot collections on OpenSea |
+| `/blast` | Fire from all wallets simultaneously |
+| `/reset` | Clear any stuck input state |
+| `/setwallet` | Import a wallet private key |
+| `/stats` | Admin only — usage data and unhandled interactions |
 
-- Eligible phase
-- Personal mint window
-- Full phase schedule
-- Contract
-- Price
-- Quantity
-- Active wallet
-- Reminder status
-- Auto-mint status
-- Gas cap approval
-- Flashbots/private relay toggle
-- Gas War mode toggle
-- Target list price and profit alert settings
-- Transparent 5% profit-fee disclosure
+## Mint confirmation card toggles
 
-After Confirm, reminders and auto-mint become active.
+- Reminders on/off
+- Auto-mint on/off  
+- Gas War mode on/off (escalates gas per retry)
+- Flashbots on/off (private mempool)
+- Set gas cap
+- Set target list price
+- Set profit alert level
 
-## Auto-Mint Behavior
+## Fee system
 
-Auto-mint is not GTD-only. It runs for whichever phase the user confirms.
+Disclosed at every mint confirmation. Bot takes 5% of profit only when an NFT is sold above mint price. Nothing on losses or break-even.
 
-Example:
+- **Base**: collected automatically after sale is detected
+- **Ethereum**: stored as pending, bundled into the next mint transaction to save gas. User is notified with the exact amount.
 
-- GTD user: timer fires at `gtdTime + 5 seconds`
-- OG user: timer fires at `ogTime + 5 seconds`
-- WL user: timer fires at `wlTime + 5 seconds`
-- Public user: timer fires at `publicTime + 5 seconds`
+## Supported chains
 
-The poller still runs every 30 seconds. It handles reminders, open-window alerts, and backup auto-mint retries if the first timer attempt fails.
+Ethereum mainnet and Base mainnet. Set both `ETHEREUM_RPC_URL` and `BASE_RPC_URL` to run dual-chain.
 
-## Gas Caps And Gas War
+## Required env vars
 
-When a user taps Confirm, MintBot estimates a recommended gas cap and shows it as ETH plus a percentage of total mint cost. The user can approve it or reply with a custom ETH cap.
-
-Gas War mode starts at the baseline gas boost and adds `GAS_WAR_STEP_PERCENT` on each retry. The user's gas cap is always the hard stop.
-
-## Profit Fee System
-
-The confirmation card clearly states:
-
-```text
-Platform fee: 5% of profit only if this NFT sells above mint price. No fee is taken on a loss or break-even sale.
+```
+TELEGRAM_BOT_TOKEN
+WALLET_ENCRYPTION_KEY
+ETHEREUM_RPC_URL
+BASE_RPC_URL
 ```
 
-The repo includes `contracts/MintRegistry.sol` and `contracts/FeeRouter.sol`. Deploy them on Ethereum and Base, then set:
+## Recommended env vars
 
-```bash
-MINT_REGISTRY_ETH=...
-MINT_REGISTRY_BASE=...
-FEE_ROUTER_CONTRACT_ETH=...
-FEE_ROUTER_CONTRACT_BASE=...
+```
+ETHERSCAN_API_KEY     — ABI resolution for mint function detection
+OPENSEA_API_KEY       — Collection lookup, trending, top offer, rarity, listings
+TREASURY_WALLET       — Your wallet address to receive the 5% fee
+ADMIN_USER_ID         — Your Telegram user ID for /stats access
 ```
 
-Alchemy webhooks should POST sale/activity payloads to:
-
-```text
-https://YOUR-RAILWAY-DOMAIN/webhooks/alchemy
-```
-
-Set `ALCHEMY_WEBHOOK_AUTH_TOKEN` and send it as the `x-mintbot-token` header from your webhook configuration.
-
-On Base, profitable sale fee collection sends 5% of profit to `TREASURY_WALLET` from the user's active wallet and then notifies the user. On Ethereum, profitable fees are stored as pending fees and the user receives this exact notice format:
-
-```text
-Your NFT sold for X ETH. Profit: X ETH. Platform fee: X ETH (5% of profit). To save you gas costs on Ethereum this will be bundled into your next mint.
-```
-
-## PostgreSQL
-
-Set `DATABASE_URL` to use PostgreSQL-backed storage. Without it, the bot uses the local JSON file so development still works.
-
-For Railway, add the Postgres plugin and copy its `DATABASE_URL` into the bot service variables.
-
-## Mint Function Detection
-
-MintBot tries to fetch the verified ABI through Etherscan V2 and detect common mint functions:
-
-- `mint`
-- `publicMint`
-- `whitelistMint`
-- `allowlistMint`
-- `presaleMint`
-- `ogMint`
-- `gtdMint`
-- `claim`
-- `purchase`
-
-If the contract requires a custom function, merkle proof, signature, or unusual args, the bot needs those details. It will not invent proofs or signatures.
-
-## Production With PM2
-
-```bash
-npm install -g pm2
-pm2 start index.js --name mintbot
-pm2 save
-pm2 startup
-```
-
-View logs:
-
-```bash
-pm2 logs mintbot
-```
-
-Restart after config changes:
-
-```bash
-pm2 restart mintbot
-```
-
-## Files
-
-- `index.js` - bot implementation
-- `.env.example` - required environment variables
-- `data/mintbot.json` - runtime database, ignored by git
-- `package.json` - dependencies and scripts
+See `.env.example` for the full list including fallback RPCs, smart contract addresses, and tuning parameters.
