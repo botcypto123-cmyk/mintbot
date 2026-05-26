@@ -9,6 +9,10 @@ const { ethers } = require("ethers");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const LEGACY_RPC_URL     = process.env.RPC_URL;
 const LEGACY_CHAIN_ID    = Number(process.env.CHAIN_ID || 1);
+// C-3: Warn on deprecated env vars so operators know to migrate.
+if (process.env.RPC_URL || process.env.CHAIN_ID) {
+  console.warn("[DEPRECATED] RPC_URL / CHAIN_ID are deprecated. Use ETHEREUM_RPC_URL / BASE_RPC_URL instead.");
+}
 const DEFAULT_TIMEZONE   = process.env.DEFAULT_TIMEZONE || "UTC";
 const AUTO_MINT_DELAY_MS = Number(process.env.AUTO_MINT_DELAY_MS   || 5000);
 const POLL_MS            = Number(process.env.POLL_INTERVAL_MS     || 30000);
@@ -121,8 +125,11 @@ class TelegramBot extends EventEmitter {
   handleUpdate(u) {
     if (u.message) {
       const msg=u.message;
-      if (msg.text) for (const h of this.textHandlers) { h.regex.lastIndex=0; const m=msg.text.match(h.regex); if(m) Promise.resolve(h.fn(msg,m)).catch(e=>this.emit("polling_error",e)); }
-      this.dispatch("message",msg);
+      // R-1: Only dispatch to message listener if no onText handler matched.
+      // Firing both causes a race condition when handlers mutate shared state.
+      let textHandled=false;
+      if (msg.text) for (const h of this.textHandlers) { h.regex.lastIndex=0; const m=msg.text.match(h.regex); if(m) { textHandled=true; Promise.resolve(h.fn(msg,m)).catch(e=>this.emit("polling_error",e)); } }
+      if (!textHandled) this.dispatch("message",msg);
     }
     if (u.callback_query) this.dispatch("callback_query",u.callback_query);
   }
@@ -165,9 +172,22 @@ const saleWatchers    = new Map();
 let db = loadDb();
 ensureDataDir();
 armAll();
-setInterval(pollLoop,         POLL_MS);
-setInterval(checkTopOffers,   TOP_OFFER_POLL_MS);
-setInterval(checkSales,       SALE_POLL_MS);
+// R-2: Use recursive setTimeout instead of setInterval so each loop waits
+// for the previous invocation to finish before scheduling the next tick.
+// setInterval on async functions allows overlapping concurrent executions
+// which causes duplicate messages and concurrent writes to shared state.
+(async function runPollLoop() {
+  await pollLoop().catch(err => console.error("pollLoop error:", err));
+  setTimeout(runPollLoop, POLL_MS);
+})();
+(async function runCheckTopOffers() {
+  await checkTopOffers().catch(err => console.error("checkTopOffers error:", err));
+  setTimeout(runCheckTopOffers, TOP_OFFER_POLL_MS);
+})();
+(async function runCheckSales() {
+  await checkSales().catch(err => console.error("checkSales error:", err));
+  setTimeout(runCheckSales, SALE_POLL_MS);
+})();
 setInterval(clearExpiredStates,60000);
 
 // ─── COMMANDS ─────────────────────────────────────────────────────────────────
@@ -178,6 +198,7 @@ bot.setMyCommands([
   {command:"status",  description:"Active mints"},
   {command:"gas",     description:"Gas prices"},
   {command:"history", description:"History & P&L"},
+  {command:"trending",description:"Trending drops"}, // U-4: was missing
   {command:"blast",   description:"Multi-wallet blast"},
   {command:"reset",   description:"Clear stuck state"},
   {command:"stats",   description:"Admin only"}
@@ -289,6 +310,10 @@ bot.on("message", async msg=>{
     if (lower==="trending") { await sendTrending(chatId);   return; }
 
     const user=getUser(chatId);
+    // F-5: Always check expiry inline before dispatching state-sensitive handlers.
+    // import_wallet state can persist across restarts (it's saved to disk), so we
+    // must guard here — not only in the 60s clearExpiredStates interval.
+    if (user.state?.at&&Date.now()-user.state.at>STATE_TIMEOUT_MS) user.state={};
     if (user.state?.mode==="import_wallet")        { await safeDelete(chatId,msg.message_id); await importWallet(chatId,text); return; }
     if (user.state?.mode==="track_input")          { await handleTrackInput(chatId,text); return; }
     if (user.state?.mode==="gas_cap")              { await handleGasCap(chatId,text,user.state); return; }
@@ -347,13 +372,15 @@ async function sendStart(chatId,from) {
     "",
     "What's next?"
   ].filter(l=>l!=="").join("\n"),{
+    // U-8: Only send the inline keyboard here. KEYBOARD (persistent reply keyboard)
+    // uses the same reply_markup key and would overwrite the inline buttons if spread.
+    // The persistent keyboard is already visible from previous sends; no need to re-send.
     reply_markup:{inline_keyboard:[
       [{text:"📊 Track a Drop",callback_data:"track:start"},{text:"⚡ Instant Mint",callback_data:"instant_mint"}],
       [{text:"📤 Send NFT",callback_data:"wallet:send_nft"},{text:"📥 Receive",callback_data:"wallet:receive"}],
       [{text:"🏆 Leaderboard",callback_data:"leaderboard"},{text:"🔥 Trending",callback_data:"trending"}],
       [{text:"💣 Blast Mint",callback_data:"blast:menu"}]
-    ]},
-    ...KEYBOARD
+    ]}
   });
 }
 
@@ -461,7 +488,9 @@ async function handleSendNftTo(chatId,text,state) {
   const wallet=activeWallet(user); if (!wallet) { await send(chatId,"No active wallet."); return; }
   await send(chatId,`Sending token #${state.tokenId} to ${shortAddr(to)}...`);
   try {
-    const provider=getProvider(defaultChain().chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    // R-9: Resolve chain from the NFT contract address, not hardcoded defaultChain().
+    const chainId=await resolveChainId(state.contract,null);
+    const provider=getProvider(chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
     const contract=new ethers.Contract(state.contract,ERC721_ABI,signer);
     const tx=await contract.transferFrom(wallet.address,to,BigInt(state.tokenId));
     await send(chatId,`Submitted. Tx: ${tx.hash}`);
@@ -491,7 +520,9 @@ async function handleSendTokenTo(chatId,text,state) {
   const wallet=activeWallet(user); if (!wallet) { await send(chatId,"No active wallet."); return; }
   await send(chatId,`Sending ${state.amount} tokens to ${shortAddr(to)}...`);
   try {
-    const provider=getProvider(defaultChain().chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
+    // R-9: Resolve chain from the token contract address, not hardcoded defaultChain().
+    const chainId=await resolveChainId(state.tokenContract,null);
+    const provider=getProvider(chainId); const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
     const contract=new ethers.Contract(state.tokenContract,ERC20_ABI,signer);
     const decimals=await contract.decimals().catch(()=>18n);
     const raw=ethers.parseUnits(String(state.amount),Number(decimals));
@@ -611,7 +642,7 @@ async function finalizeConfirm(chatId,mint) {
   mint.confirmed=true; mint.confirmedAt=Date.now(); mint.updatedAt=Date.now();
   user.mints=user.mints||[]; user.mints.push(mint);
   user.pendingMint=null; user.state={};
-  lbAdd(chatId,"totalMints",0); saveDb();
+  lbAdd(chatId,"totalMints",1); saveDb(); // F-6: was 0 — counter never incremented
   await send(chatId,[
     `Locked in: ${mint.mintName}`,
     "",
@@ -635,7 +666,8 @@ async function handleTargetList(chatId,text,state) {
 }
 
 async function handleProfitAlert(chatId,text,state) {
-  const v=parseInt(text.trim(),10); if (!Number.isFinite(v)||v<2) { await send(chatId,"Enter 2 or higher. Example: 3 = start alerts at 3x."); return; }
+  // R-11: Use Number() not parseInt() — parseInt("2.9") returns 2, silently truncating.
+  const v=Number(text.trim()); if (!Number.isInteger(v)||v<2) { await send(chatId,"Enter a whole number 2 or higher. Example: 3 = start alerts at 3x."); return; }
   const user=getUser(chatId); const mint=user.pendingMint||(user.mints||[]).find(m=>m.id===state.mintId);
   if (!mint) { user.state={}; saveDb(); await send(chatId,"Mint not found."); return; }
   mint.profitAlertStart=v; user.state={}; saveDb();
@@ -675,7 +707,12 @@ async function doInstantMintFromUrl(chatId,text) {
     const cand=pickMintFn(iface,{quantity:1,mintFunction:null,mintArgs:null,merkleProof:null},signer.address);
     if (!cand) { await send(chatId,"Couldn't find a mint function on that contract."); return; }
     const feeData=await provider.getFeeData(); const gas=buildGas(feeData,false,0);
-    const tx=await c[cand.functionKey](...cand.args,{...gas,value:0n});
+    // F-2: Resolve actual mint price — hardcoded 0n caused paid mints to always revert.
+    const readContract=new ethers.Contract(contract,mergeAbi(abi,READ_ONLY_ABI),provider.getActive());
+    const priceStr=await readPrice(readContract,"public");
+    const value=priceStr?ethers.parseEther(priceStr):0n;
+    const gasLimit=await resolveGasLimit(c,cand,value);
+    const tx=await c[cand.functionKey](...cand.args,{...gas,gasLimit,value});
     const r=await tx.wait(1);
     if (r?.status===1) await send(chatId,`✅ Minted.\nTx: ${tx.hash}`);
     else await send(chatId,`May have failed. Check: ${tx.hash}`);
@@ -710,8 +747,15 @@ async function handleBlastUrl(chatId,text) {
   user.state={};
   if (!contract&&os.slug) { try { const col=await fetchOsCollection(os.slug); contract=col.contractAddress; chainId=col.chainId||chainId; } catch { await send(chatId,"Couldn't resolve. Paste a contract address directly."); return; } }
   if (!contract) { await send(chatId,"No contract found."); return; }
+  // R-8: Resolve the actual mint price so blast doesn't fire with value:0n on paid contracts.
+  let priceEth=null;
+  try {
+    const provider=getProvider(chainId);
+    const readContract=new ethers.Contract(contract,READ_ONLY_ABI,provider.getActive());
+    priceEth=await readPrice(readContract,"public");
+  } catch {}
   // Fire immediately — no second confirmation
-  const fakeMint=buildMintRecord({contractAddress:contract,chainId,chainName:defaultChain().chainName,userTier:"public",mintTime:Date.now(),priceEth:null},{quantity:1});
+  const fakeMint=buildMintRecord({contractAddress:contract,chainId,chainName:defaultChain().chainName,userTier:"public",mintTime:Date.now(),priceEth},{quantity:1});
   user.blastPending=fakeMint; saveDb();
   await executeBlast(chatId,fakeMint.id);
 }
@@ -744,12 +788,11 @@ function armAll() {
   for (const [chatId,user] of Object.entries(db.users||{})) {
     for (const mint of user.mints||[]) {
       if (!mint.confirmed) continue;
+      if (mint.completedAt) continue; // R-5: don't arm timers for completed mints on restart
       scheduleMint(chatId,mint);
-      if (!mint.completedAt) {
-        if (!mint.autoMint?.success&&mint.mintTime&&Date.now()<Number(mint.mintTime)+RETRY_WINDOW_MS) startMempoolWatcher(chatId,mint);
-        if (mint._watcherState) startTopOfferWatcher(chatId,mint);
-        if (mint._mintedTokenIds?.length&&!mint._saleClosed) startSaleWatcher(chatId,mint);
-      }
+      if (!mint.autoMint?.success&&mint.mintTime&&Date.now()<Number(mint.mintTime)+RETRY_WINDOW_MS) startMempoolWatcher(chatId,mint);
+      if (mint._watcherState) startTopOfferWatcher(chatId,mint);
+      if (mint._mintedTokenIds?.length&&!mint._saleClosed) startSaleWatcher(chatId,mint);
     }
   }
 }
@@ -759,6 +802,7 @@ async function pollLoop() {
   for (const [chatId,user] of Object.entries(db.users||{})) {
     for (const mint of user.mints||[]) {
       if (!mint.confirmed||!mint.mintTime) continue;
+      if (mint.completedAt) continue; // R-4: skip completed mints — was iterating them every tick
       if (mint.remindersEnabled) {
         for (const r of REMINDERS) {
           const due=mint.mintTime-r.seconds*1000;
@@ -835,21 +879,25 @@ async function runAutoMint(chatId,user,mint,walletRecord) {
   const value=mintValue(mint); const feeData=await provider.getFeeData();
   const attempt=mint.autoMint?.attempts||0; const useWar=mint.gasWarMode||user.gasWarMode;
   const gas=buildGas(feeData,useWar,attempt);
+  // R-3: Compute gas limit once and reuse — was calling resolveGasLimit twice,
+  // wasting an RPC round-trip and allowing the cap check and actual limit to diverge.
+  const gasLimit=await resolveGasLimit(contract,cand,value);
   if (mint._userGasCap) {
     const capWei=ethers.parseEther(String(mint._userGasCap));
-    const limit=await resolveGasLimit(contract,cand,value);
-    const cost=limit*(gas.maxFeePerGas||gas.gasPrice||0n);
+    const cost=gasLimit*(gas.maxFeePerGas||gas.gasPrice||0n);
     if (cost>capWei) throw new Error(`Gas cap hit. Estimated: ${ethers.formatEther(cost)} ETH, cap: ${mint._userGasCap} ETH.`);
   }
-  const gasLimit=await resolveGasLimit(contract,cand,value);
   const balance=await provider.getBalance(signer.address);
   const maxCost=gasLimit*(gas.maxFeePerGas||gas.gasPrice||0n);
-  const pendingFeeWei=await collectPendingFee(chatId,user,value,signer,mint.chainId);
+  // F-4: Estimate pending fee for balance check but don't send it until mint confirms.
+  const pendingFeeWei=estimatePendingFee(user);
   const totalValue=value+pendingFeeWei;
   if (balance<totalValue+maxCost) throw new Error(`Not enough ETH. Need ~${ethers.formatEther(totalValue+maxCost)}, have ${ethers.formatEther(balance)}.`);
-  const tx=await contract[cand.functionKey](...cand.args,{...gas,gasLimit,value:totalValue});
+  const tx=await contract[cand.functionKey](...cand.args,{...gas,gasLimit,value});
   const receipt=await tx.wait(1);
   if (!receipt||receipt.status!==1) throw new Error(`Reverted: ${tx.hash}`);
+  // F-4: Only collect the pending fee after the mint is confirmed on-chain.
+  await collectPendingFee(chatId,user,value,signer,mint.chainId);
   return {hash:tx.hash,receipt};
 }
 
@@ -1038,22 +1086,48 @@ async function doListing(chatId,mint,priceEth) {
   if (!mint.contractAddress) { await send(chatId,"No contract address on this mint."); return; }
   const chain=mint.chainId===8453?"base":"ethereum";
   const priceWei=ethers.parseEther(String(priceEth));
-  await send(chatId,`Listing ${mint.mintName} at ${priceEth} ETH...`);
+  // U-3: Send "Listing..." only after initial validation passes, not before async work,
+  // so users don't see "Listing at X ETH..." followed immediately by a validation error.
   try {
     const provider=getProvider(mint.chainId);
     const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
     let tokenId=mint._lastMintedTokenId||await fetchFirstToken(signer.address,mint.contractAddress,mint.chainId);
     if (!tokenId) { await send(chatId,`No token found for ${mint.mintName} in this wallet.`); return; }
+    await send(chatId,`Listing ${mint.mintName} at ${priceEth} ETH...`);
     const expiry=Math.floor(Date.now()/1000)+60*60*24*30;
+    // F-7: Fetch the offerer's current Seaport counter on-chain.
+    // Hardcoded "0" causes signature mismatch for users who have cancelled orders before.
+    const seaportAddress="0x0000000000000068f116a894984e2db1123eb395";
+    const seaportContract=new ethers.Contract(seaportAddress,["function getCounter(address offerer) view returns (uint256)"],provider.getActive());
+    const counter=(await seaportContract.getCounter(signer.address)).toString();
+    // F-8: Fetch creator royalties from OpenSea and include them in consideration.
+    // Without royalty items, OpenSea marks the listing as royalty-bypassing.
+    let royaltyConsideration=[];
+    try {
+      const royaltyData=await fetchJson(`https://api.opensea.io/api/v2/chain/${chain}/contract/${mint.contractAddress}/fee`,osHeaders());
+      const fees=royaltyData.fees||royaltyData.seller_fees||[];
+      for (const fee of fees) {
+        if (!fee.recipient||!fee.basis_points) continue;
+        const royaltyWei=priceWei*BigInt(fee.basis_points)/10000n;
+        if (royaltyWei>0n) royaltyConsideration.push({itemType:0,token:ethers.ZeroAddress,identifierOrCriteria:"0",startAmount:royaltyWei.toString(),endAmount:royaltyWei.toString(),recipient:fee.recipient});
+      }
+    } catch {}
+    // Reduce seller amount by royalties so total ETH adds up correctly.
+    const royaltyTotal=royaltyConsideration.reduce((s,r)=>s+BigInt(r.startAmount),0n);
+    const sellerAmount=(priceWei-royaltyTotal>0n?priceWei-royaltyTotal:priceWei).toString();
+    const consideration=[
+      {itemType:0,token:ethers.ZeroAddress,identifierOrCriteria:"0",startAmount:sellerAmount,endAmount:sellerAmount,recipient:signer.address},
+      ...royaltyConsideration
+    ];
     const orderParams={
       offerer:signer.address, zone:ethers.ZeroAddress,
       offer:[{itemType:2,token:mint.contractAddress,identifierOrCriteria:tokenId,startAmount:"1",endAmount:"1"}],
-      consideration:[{itemType:0,token:ethers.ZeroAddress,identifierOrCriteria:"0",startAmount:priceWei.toString(),endAmount:priceWei.toString(),recipient:signer.address}],
+      consideration,
       orderType:0, startTime:Math.floor(Date.now()/1000).toString(), endTime:expiry.toString(),
       zoneHash:"0x0000000000000000000000000000000000000000000000000000000000000000",
       salt:ethers.hexlify(ethers.randomBytes(16)),
       conduitKey:"0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
-      counter:"0"
+      counter
     };
     const domain={name:"Seaport",version:"1.6",chainId:mint.chainId,verifyingContract:"0x0000000000000068f116a894984e2db1123eb395"};
     const types={
@@ -1094,8 +1168,13 @@ async function collectProfitFee(chatId,mint,salePriceEth) {
   const mintPrice=parseFloat(mint.priceEth||0);
   if (!mintPrice||salePriceEth<=mintPrice) return;
   const profit=salePriceEth-mintPrice;
-  const fee=profit*FEE_BPS/10000;
-  if (fee<=0) return;
+  // F-3: Compute fee in BigInt from the start to avoid float precision errors.
+  const mintPriceWei =ethers.parseEther(String(mintPrice));
+  const salePriceWei =ethers.parseEther(String(salePriceEth));
+  const profitWei    =salePriceWei-mintPriceWei;
+  const feeWei       =profitWei*BigInt(FEE_BPS)/10000n;
+  const feeEth       =parseFloat(ethers.formatEther(feeWei));
+  if (feeWei<=0n) return;
   const user=getUser(chatId); const wallet=activeWallet(user); if (!wallet) return;
   lbAdd(chatId,"totalProfit",profit);
   const prev=user.leaderboard?.bestSingleMint||0;
@@ -1106,7 +1185,7 @@ async function collectProfitFee(chatId,mint,salePriceEth) {
     try {
       const provider=getProvider(mint.chainId);
       const signer=new ethers.Wallet(decryptKey(wallet.encKey),provider.getActive());
-      const feeWei=ethers.parseUnits(profit.toFixed(18),"ether")*BigInt(FEE_BPS)/10000n;
+      // F-3: feeWei is already BigInt — no float conversion needed.
       const tx=await signer.sendTransaction({to:TREASURY,value:feeWei});
       await tx.wait(1);
     } catch(err) { console.error("Fee collection failed:",err.message); }
@@ -1118,7 +1197,9 @@ async function collectProfitFee(chatId,mint,salePriceEth) {
   } else {
     // Ethereum — store pending, notify sale result + one-line bundle note
     user.pendingFee=user.pendingFee||{};
-    user.pendingFee[mint.id]={feeEth:fee,mintName:mint.mintName,salePriceEth,mintPriceEth:mintPrice,profitEth:profit,at:Date.now()};
+    // F-3: Store feeEth as the pre-computed fee string (not profit) so collectPendingFee
+    // can do a straight parseEther conversion without re-applying FEE_BPS.
+    user.pendingFee[mint.id]={feeEth:ethers.formatEther(feeWei),mintName:mint.mintName,salePriceEth,mintPriceEth:mintPrice,profitEth:profit,at:Date.now()};
     await send(chatId,[
       `${mint.mintName} sold — ${salePriceEth} ETH`,
       `Profit: +${profit.toFixed(4)} ETH`,
@@ -1126,6 +1207,21 @@ async function collectProfitFee(chatId,mint,salePriceEth) {
     ].join("\n"));
   }
   saveDb();
+}
+
+// F-4 helper: estimate pending fee size for balance pre-check without sending it yet.
+function estimatePendingFee(user) {
+  if (!TREASURY||!ethers.isAddress(TREASURY)) return 0n;
+  const pending=user.pendingFee||{}; const keys=Object.keys(pending);
+  if (!keys.length) return 0n;
+  let total=0n;
+  for (const k of keys) {
+    // F-1 + F-3: feeEth is already the computed fee (profit × 5%). Convert to wei
+    // using BigInt math — no float ops — and do NOT apply FEE_BPS again.
+    const feeWei=ethers.parseEther(String(pending[k].feeEth));
+    total+=feeWei;
+  }
+  return total;
 }
 
 async function collectPendingFee(chatId,user,value,signer,chainId) {
@@ -1136,8 +1232,9 @@ async function collectPendingFee(chatId,user,value,signer,chainId) {
   const snapshot={}; let total=0n;
   for (const k of keys) {
     snapshot[k]=pending[k];
-    // Convert safely via parseUnits to avoid float precision issues
-    const feeWei=ethers.parseUnits(pending[k].feeEth.toFixed(18),"ether")*BigInt(FEE_BPS)/10000n;
+    // F-1: feeEth is already the final fee amount — do NOT apply FEE_BPS again.
+    // F-3: Convert via parseEther (BigInt path) — no float subtraction precision loss.
+    const feeWei=ethers.parseEther(String(pending[k].feeEth));
     total+=feeWei;
     delete pending[k];
   }
@@ -1192,7 +1289,9 @@ async function sendGas(chatId,opts={}) {
 
 async function sendHistory(chatId) {
   const user=getUser(chatId); const history=user.mintHistory||[]; const pnl=getPnL(user);
-  const lines=["Mint History","",`Total mints:  ${pnl.totalMints}`,`ETH spent:    ${pnl.spent.toFixed(4)}`,`Profit:       +${pnl.returned.toFixed(4)} ETH`,`Net:          ${pnl.net>=0?"+":""}${pnl.net.toFixed(4)} ETH`,""];
+  // U-1: pnl.returned is total ETH returned (spent + profit), not net profit.
+  // Label it accurately so users don't see a contradictory "Profit: +1.1 / Net: +0.1".
+  const lines=["Mint History","",`Total mints:  ${pnl.totalMints}`,`ETH spent:    ${pnl.spent.toFixed(4)}`,`Returned:     ${pnl.returned.toFixed(4)} ETH`,`Net:          ${pnl.net>=0?"+":""}${pnl.net.toFixed(4)} ETH`,""];
   if (!history.length) { lines.push("No mints yet. Track a drop to get started."); }
   else { for (const h of history.slice(0,10)) { lines.push(`${h.mintName} (${(h.userTier||"").toUpperCase()})`,`Status: ${h.status}`,h.txHash?`Tx: ${h.txHash}`:null,`Time: ${formatDt(h.timestamp)}`,""); } }
   await send(chatId,lines.filter(l=>l!==null).join("\n"),KEYBOARD);
@@ -1237,7 +1336,10 @@ async function sendLeaderboard(chatId) {
   const medals=["🥇","🥈","🥉"]; const lines=["🏆 Leaderboard",""];
   for (const [i,e] of entries.slice(0,10).entries()) {
     const medal=medals[i]||`${i+1}.`;
-    const nameLink=e.telegramId?`[${e.name}](tg://user?id=${e.telegramId})`:e.name;
+    // U-7: Escape Markdown-special characters in user-controlled names to prevent
+    // link injection. e.g. a name like "[evil](http://phish.site" would break the leaderboard.
+    const safeName=e.name.replace(/[[\]()]/g,"\\$&");
+    const nameLink=e.telegramId?`[${safeName}](tg://user?id=${e.telegramId})`:safeName;
     lines.push(`${medal} ${nameLink}`,`${e.totalMints} mints · +${e.totalProfit.toFixed(4)} ETH profit · Best: ${e.bestSingleMint.toFixed(4)} ETH`,"");
   }
   await send(chatId,lines.join("\n"),{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔄 Refresh",callback_data:"leaderboard"}]]}});
@@ -1339,16 +1441,21 @@ async function verifyFromContract(draft) {
 }
 
 async function readPhaseTimes(contract) {
+  // P-3: Batch all reads per tier in parallel — was sequential RPC calls for every field name.
   const result={};
-  for (const [tier,names] of Object.entries(PHASE_TIMES)) {
-    for (const name of names) { const ts=await tryTimestamp(contract,name); if(ts){result[`${tier}Time`]=ts;break;} }
-  }
+  await Promise.all(Object.entries(PHASE_TIMES).map(async ([tier,names])=>{
+    const results=await Promise.allSettled(names.map(name=>tryTimestamp(contract,name)));
+    for (const r of results) { if (r.status==="fulfilled"&&r.value) { result[`${tier}Time`]=r.value; break; } }
+  }));
   return result;
 }
 
 async function readPrice(contract,tier) {
+  // P-3: Batch all price reads in parallel — was sequential.
   const names=[...(PHASE_PRICES[normTier(tier)]||[]),...PRICE_READS];
-  for (const name of [...new Set(names)]) { const v=await tryUint(contract,name); if(v!=null) return ethers.formatEther(v); }
+  const unique=[...new Set(names)];
+  const results=await Promise.allSettled(unique.map(name=>tryUint(contract,name)));
+  for (const r of results) { if (r.status==="fulfilled"&&r.value!=null) return ethers.formatEther(r.value); }
   return null;
 }
 
@@ -1411,8 +1518,13 @@ async function resolveGasLimit(contract,cand,value) {
   catch { return DEFAULT_GAS_LIMIT; }
 }
 
+// P-2: ABI cache — deployed contracts don't change their ABI.
+// Cache indefinitely to avoid repeated Etherscan round-trips on retries.
+const abiCache = new Map();
 async function resolveAbi(mint) {
   if (!process.env.ETHERSCAN_API_KEY) return COMMON_ABI;
+  const cacheKey=`${mint.chainId||defaultChain().chainId}:${mint.contractAddress}`;
+  if (abiCache.has(cacheKey)) return abiCache.get(cacheKey);
   try {
     const url=new URL("https://api.etherscan.io/v2/api");
     url.searchParams.set("chainid",String(mint.chainId||defaultChain().chainId));
@@ -1420,7 +1532,9 @@ async function resolveAbi(mint) {
     url.searchParams.set("address",mint.contractAddress); url.searchParams.set("apikey",process.env.ETHERSCAN_API_KEY);
     const data=await fetchJson(url.toString());
     if (data.status!=="1") return COMMON_ABI;
-    return JSON.parse(data.result);
+    const abi=JSON.parse(data.result);
+    abiCache.set(cacheKey,abi);
+    return abi;
   } catch { return COMMON_ABI; }
 }
 
@@ -1528,7 +1642,9 @@ function ensureDataDir() { fs.mkdirSync(path.dirname(DATA_FILE),{recursive:true}
 
 // ─── CRYPTO ───────────────────────────────────────────────────────────────────
 function encReady()  { return WALLET_KEY?.length>=16; }
-function encKey_()   { return crypto.createHash("sha256").update(WALLET_KEY).digest(); }
+// P-1: Pre-compute the derived key once at startup — WALLET_KEY is constant.
+const ENC_KEY = WALLET_KEY ? crypto.createHash("sha256").update(WALLET_KEY).digest() : null;
+function encKey_()   { return ENC_KEY; }
 function encryptKey(key) { const iv=crypto.randomBytes(12); const c=crypto.createCipheriv("aes-256-gcm",encKey_(),iv); const enc=Buffer.concat([c.update(key,"utf8"),c.final()]); const tag=c.getAuthTag(); return `${iv.toString("hex")}:${tag.toString("hex")}:${enc.toString("hex")}`; }
 function decryptKey(payload) { const [ivH,tagH,encH]=payload.split(":"); const d=crypto.createDecipheriv("aes-256-gcm",encKey_(),Buffer.from(ivH,"hex")); d.setAuthTag(Buffer.from(tagH,"hex")); return Buffer.concat([d.update(Buffer.from(encH,"hex")),d.final()]).toString("utf8"); }
 function normKey(k) { const s=k.trim(); return s.startsWith("0x")?s:`0x${s}`; }
@@ -1552,7 +1668,10 @@ function buildMintRecord(parsed,draft) {
     quantity:Math.max(1,Number(merged.quantity||1)),
     mintFunction:merged.mintFunction||null,mintArgs:Array.isArray(merged.mintArgs)?merged.mintArgs:null,
     sourceUrl:merged.sourceUrl||null,openSeaSlug:merged.openSeaSlug||null,metadata:merged.metadata||null,
-    confirmed:false,remindersEnabled:merged.remindersEnabled!==false,autoMintEnabled:merged.autoMintEnabled!==false,
+    confirmed:false,remindersEnabled:merged.remindersEnabled!==false,
+    // U-2: Auto-mint defaults OFF — opt-in not opt-out. Firing real wallet transactions
+    // without explicit user consent is a significant default to get wrong.
+    autoMintEnabled:merged.autoMintEnabled===true,
     gasWarMode:merged.gasWarMode||false,flashbotsEnabled:merged.flashbotsEnabled||false,
     firedReminders:[],openAlertSent:false,
     autoMint:{scheduled:false,attempts:0,success:false,inFlight:false,txHash:null,lastError:null},
@@ -1593,9 +1712,18 @@ function uid(bytes=8)   { return crypto.randomBytes(bytes).toString("hex"); }
 function sleep(ms)      { return new Promise(r=>setTimeout(r,ms)); }
 function looksLikeMint(t){ return /\b(mint|drop|wl|whitelist|allowlist|gtd|guaranteed|og|public|presale|contract|0x[a-fA-F0-9]{40})\b/i.test(t); }
 
+// R-7: Cache balances per address with a 30s TTL — was making a live RPC call on every
+// /start, /status, and /wallet open. Fine at 5 users, slow at 500.
+const balanceCache = new Map();
 async function quickBalance(wallet) {
-  try { const p=getProvider(defaultChain().chainId); const bal=await p.getBalance(wallet.address); return `(${parseFloat(ethers.formatEther(bal)).toFixed(4)} ETH)`; }
-  catch { return ""; }
+  const cacheKey=wallet.address; const cached=balanceCache.get(cacheKey);
+  if (cached&&Date.now()-cached.ts<30000) return cached.bal;
+  try {
+    const p=getProvider(defaultChain().chainId); const bal=await p.getBalance(wallet.address);
+    const result=`(${parseFloat(ethers.formatEther(bal)).toFixed(4)} ETH)`;
+    balanceCache.set(cacheKey,{bal:result,ts:Date.now()});
+    return result;
+  } catch { return ""; }
 }
 
 async function send(chatId,text,opts={}) {

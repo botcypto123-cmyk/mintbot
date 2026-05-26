@@ -9,8 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "ethers": "^6.13.5",
-    "ethers-decode-error": "^2.1.3"
+    "ethers": "^6.13.5"
   },
   "engines": {
     "node": ">=20"
